@@ -587,6 +587,139 @@ async def test_department_config(name: str):
     }
 
 
+# ── Marketing ───────────────────────────────────────────────────────────────
+# Product profile (singleton) + ad-hoc social-post drafting. LLM calls route
+# through the `marketing` department's configured provider.
+
+from marketing import db as mdb
+from marketing.platforms import PLATFORMS
+from marketing.drafter import draft_posts as _draft_posts
+
+
+class ProductBody(BaseModel):
+    name: str
+    one_liner: Optional[str] = ""
+    audience: Optional[str] = ""
+    tone: Optional[str] = ""
+    key_messages: Optional[list[str]] = None
+    links: Optional[list[dict]] = None
+
+
+class DraftRequest(BaseModel):
+    platform: str
+    topic: str
+    variants: int = 3
+
+
+class DraftUpdate(BaseModel):
+    content: Optional[str] = None
+    status: Optional[str] = None
+    rating: Optional[int] = None
+    notes: Optional[str] = None
+
+
+@app.get("/api/marketing/platforms")
+def marketing_platforms():
+    """Static platform metadata — used by the UI to label selects and show char limits."""
+    return [
+        {
+            "id": key,
+            "label": spec.label,
+            "char_limit": spec.char_limit,
+            "format_rules": spec.format_rules,
+        }
+        for key, spec in PLATFORMS.items()
+    ]
+
+
+@app.get("/api/marketing/product")
+def marketing_get_product():
+    product = mdb.get_product()
+    if not product:
+        raise HTTPException(404, "No product row found")
+    return product
+
+
+@app.put("/api/marketing/product")
+def marketing_put_product(body: ProductBody):
+    return mdb.upsert_product(
+        name=body.name,
+        one_liner=body.one_liner or "",
+        audience=body.audience or "",
+        tone=body.tone or "",
+        key_messages=body.key_messages or [],
+        links=body.links or [],
+    )
+
+
+@app.post("/api/marketing/draft")
+async def marketing_draft(body: DraftRequest):
+    if body.platform not in PLATFORMS:
+        raise HTTPException(400, f"Unknown platform '{body.platform}'")
+    if not (1 <= body.variants <= 5):
+        raise HTTPException(400, "variants must be between 1 and 5")
+
+    product = mdb.get_product() or {
+        "name": "(unset)", "one_liner": "", "audience": "", "tone": "",
+        "key_messages": [], "links": [],
+    }
+    try:
+        drafts = await _draft_posts(
+            platform=body.platform,
+            topic=body.topic,
+            product=product,
+            variants=body.variants,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Draft generation failed: {e}")
+
+    return mdb.save_drafts(body.platform, body.topic, drafts)
+
+
+@app.get("/api/marketing/drafts")
+def marketing_list_drafts(
+    platform: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+):
+    try:
+        return mdb.list_drafts(platform=platform, status=status, limit=limit)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/marketing/drafts/{draft_id}")
+def marketing_get_draft(draft_id: str):
+    draft = mdb.get_draft(draft_id)
+    if not draft:
+        raise HTTPException(404, f"Draft not found: {draft_id}")
+    return draft
+
+
+@app.put("/api/marketing/drafts/{draft_id}")
+def marketing_update_draft(draft_id: str, body: DraftUpdate):
+    try:
+        updated = mdb.update_draft(
+            draft_id,
+            content=body.content,
+            status=body.status,
+            rating=body.rating,
+            notes=body.notes,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not updated:
+        raise HTTPException(404, f"Draft not found: {draft_id}")
+    return updated
+
+
+@app.delete("/api/marketing/drafts/{draft_id}")
+def marketing_delete_draft(draft_id: str):
+    if not mdb.delete_draft(draft_id):
+        raise HTTPException(404, f"Draft not found: {draft_id}")
+    return {"status": "deleted", "draft_id": draft_id}
+
+
 # ── Health ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")

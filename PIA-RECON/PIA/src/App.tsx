@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import DepartmentsPanel from "./DepartmentsPanel";
+import MarketingPanel from "./MarketingPanel";
 
 // ── Design Tokens ──────────────────────────────────────────────────────────
 const T = {
@@ -72,6 +73,7 @@ const I = {
   EyeOff: () => <svg width="0.875em" height="0.875em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><line x1="1" y1="1" x2="23" y2="23"/></svg>,
   Eye: () => <svg width="0.875em" height="0.875em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>,
   Refresh: () => <svg width="0.875em" height="0.875em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>,
+  Megaphone: () => <svg width="1.125em" height="1.125em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 11v2a1 1 0 0 0 1 1h3l5 4V6L7 10H4a1 1 0 0 0-1 1z"/><path d="M16 8a5 5 0 0 1 0 8"/></svg>,
 };
 
 // ── Shared Components ──────────────────────────────────────────────────────
@@ -110,7 +112,7 @@ function Confirm({ msg, onOk, onNo }: { msg: string; onOk: () => void; onNo: () 
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
 function Sidebar({ view, setView, unseenCount }: { view: string; setView: (v: string) => void; unseenCount: number }) {
-  const nav = [{ id: "dashboard", label: "Dashboard", Ic: I.Dashboard }, { id: "watchdog", label: "Watchdog", Ic: I.Shield }, { id: "hits", label: "Intel Feed", Ic: I.Zap, badge: unseenCount }, { id: "departments", label: "Departments", Ic: I.Gear }];
+  const nav = [{ id: "dashboard", label: "Dashboard", Ic: I.Dashboard }, { id: "watchdog", label: "Watchdog", Ic: I.Shield }, { id: "hits", label: "Intel Feed", Ic: I.Zap, badge: unseenCount }, { id: "marketing", label: "Marketing", Ic: I.Megaphone }, { id: "departments", label: "Departments", Ic: I.Gear }];
   const bs = (id: string, a: boolean): React.CSSProperties => ({ display: "flex", alignItems: "center", gap: "1rem", padding: "1rem 1.5rem", border: "none", position: "relative", background: a ? T.sContainer : "transparent", borderLeft: a ? `0.125rem solid ${T.secondary}` : "0.125rem solid transparent", color: a ? T.secondary : T.outline, fontFamily: F.head, fontSize: "0.75rem", fontWeight: 600, letterSpacing: "0.15em", textTransform: "uppercase", cursor: "pointer", transition: "all 0.2s", textAlign: "left", width: "100%" });
   return (
     <aside style={{ position: "fixed", left: 0, top: 0, height: "100vh", width: SIDEBAR_W, zIndex: 40, background: T.sContainerLow, display: "flex", flexDirection: "column", borderRight: `0.0625rem solid ${T.outlineVar}10` }}>
@@ -509,6 +511,7 @@ export default function App() {
           {view === "watchdog" && <WatchdogView targets={targets} refresh={refresh} onRunCheck={handleRunCheck} checking={checking} />}
           {view === "hits" && <HitsView hits={hits} refresh={refresh} />}
           {view === "settings" && <SettingsView targets={targets} hits={hits} refresh={refresh} />}
+          {view === "marketing" && <MarketingPanel />}
           {view === "departments" && <DepartmentsPanel />}
         </div>
       </main>
