@@ -44,12 +44,20 @@ cd personal-intelligence-agency
 # ── Backend ─────────────────────────────────────────────────────
 cd PIA-RECON
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+# Activate the venv:
+#   macOS/Linux (bash/zsh):   source .venv/bin/activate
+#   Windows (PowerShell):     .venv\Scripts\Activate.ps1
+#   Windows (cmd.exe):        .venv\Scripts\activate.bat
+source .venv/bin/activate
+
 pip install -r requirements.txt
 
-# Copy the env template and fill in whichever keys you'll use
+# Copy the env template and fill in whichever keys you'll use:
+#   macOS/Linux:              cp .env.example .env && $EDITOR .env
+#   Windows (PowerShell):     Copy-Item .env.example .env ; notepad .env
+#   Windows (cmd.exe):        copy .env.example .env && notepad .env
 cp .env.example .env
-$EDITOR .env
 
 # ── Frontend ────────────────────────────────────────────────────
 cd PIA
@@ -63,24 +71,48 @@ automatically on first run — no manual migration step.
 ## Run
 
 Open two terminals from inside `PIA-RECON/`, both with the virtualenv
-activated and the `.env` file exported (see below).
+activated and the `.env` file loaded into the environment (see below).
 
-**Terminal 1 — API + scheduler:**
+### Terminal 1 — API + scheduler
+
+The `.env` file is just text; nothing reads it automatically. You have to
+load it into the current shell before launching uvicorn, or the startup
+log will print `env check: ANTHROPIC_API_KEY=missing` and every LLM call
+will fail.
+
+**macOS / Linux (bash/zsh):**
 ```bash
-# Export the env vars declared in .env (bash/zsh):
 set -a; source .env; set +a
-
 uvicorn api:app --reload --port 8000
 ```
+
+**Windows (PowerShell):**
+```powershell
+Get-Content .env | ? {$_ -match '^\s*([^#=]+?)\s*=\s*(.*)$'} | % { [Environment]::SetEnvironmentVariable($matches[1], $matches[2]) }
+uvicorn api:app --reload --port 8000
+```
+
+**Windows (cmd.exe):**
+```cmd
+for /f "usebackq tokens=1,* delims==" %A in (".env") do @set "%A=%B"
+uvicorn api:app --reload --port 8000
+```
+
+On a successful boot the API logs one line per referenced env var, e.g.
+`env check: ANTHROPIC_API_KEY=present`. If it says `missing`, the loader
+above didn't run in this shell — re-run it, then restart uvicorn.
 
 This starts the FastAPI server *and* the in-process APScheduler that runs
 enabled watch targets on their configured cron cadence.
 
-**Terminal 2 — frontend:**
+### Terminal 2 — frontend
+
 ```bash
 cd PIA
 npm run dev
 ```
+
+(Same command in every shell — `npm` works identically on Windows.)
 
 Vite prints a local URL (usually <http://localhost:5173>). Open it in a
 browser. The sidebar gives you:
@@ -90,6 +122,21 @@ browser. The sidebar gives you:
 - **Intel Feed** — hits the watchdog has surfaced, with ratings
 - **Marketing** — edit the product profile, generate social-post drafts
 - **Departments** — per-department provider/model/env-var-name config + test
+
+### A note on `.env` values and quotes
+
+Write values **without** quotes — the bash and PowerShell loaders above
+both take the literal right-hand side of `KEY=value`. `bash source` strips
+surrounding quotes; the cmd.exe `for /f` loader does not. The safe format
+across every platform is:
+
+```
+ANTHROPIC_API_KEY=sk-ant-api03-...
+```
+
+not `ANTHROPIC_API_KEY="sk-ant-api03-..."`. A quoted value on Windows cmd
+will end up with literal quote characters in the env var and Anthropic
+will reject it as malformed.
 
 ## First-run checklist
 
@@ -218,10 +265,14 @@ If you ever paste a key somewhere it shouldn't be:
 - **`ModuleNotFoundError: feedparser`** — dependencies aren't installed in
   the active Python. Re-activate the venv and re-run
   `pip install -r requirements.txt`.
-- **Departments → Test returns `error: ANTHROPIC_API_KEY is not set`** —
-  the API process didn't inherit the env var. Make sure you ran
-  `set -a; source .env; set +a` (bash/zsh) in the same shell that launched
-  uvicorn.
+- **Startup log shows `env check: ANTHROPIC_API_KEY=missing`, or
+  Departments → Test returns `error: ANTHROPIC_API_KEY is not set`** —
+  the uvicorn process didn't inherit the env var. `.env` is inert by
+  itself; you have to load it into the shell *first*. In the same window
+  that launches uvicorn, run the loader for your shell from the **Run**
+  section above (bash: `set -a; source .env; set +a`; PowerShell: the
+  `Get-Content .env | ...` one-liner; cmd.exe: the `for /f` loop), then
+  restart uvicorn and confirm the startup line now reads `present`.
 - **Ollama** — configure the marketing (or any) department with
   `provider=openai`, `base_url=http://localhost:11434/v1`,
   `api_key_ref=OLLAMA_API_KEY`, and set `OLLAMA_API_KEY=ollama` in `.env`
