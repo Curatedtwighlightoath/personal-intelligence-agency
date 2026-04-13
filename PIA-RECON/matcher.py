@@ -1,28 +1,22 @@
 """
 LLM matching layer.
 Takes raw items + match criteria, returns structured match results.
-Uses Claude Sonnet for cost-effective high-frequency scoring.
 
-Requires ANTHROPIC_API_KEY environment variable.
+The LLM provider (Anthropic / OpenAI / Ollama / anything OpenAI-compatible)
+is chosen per department via the department_config table — see
+providers.registry.get_provider. No API client is constructed here.
 """
 
-import json
-import os
 from dataclasses import dataclass
 
-import anthropic
-
 from models import RawItem
+from providers import LLMProvider, get_provider
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
 # Max items per API call — keeps prompts focused and token usage predictable.
 # RSS feeds with 20+ items get chunked into groups of this size.
 BATCH_CHUNK_SIZE = 10
-
-# Model choice — Sonnet for cost-effective high-frequency scoring.
-# Haiku would be cheaper but less reliable on nuanced matching criteria.
-MODEL = "claude-sonnet-4-20250514"
 
 # ── Data ─────────────────────────────────────────────────────────────────────
 
@@ -128,23 +122,17 @@ def _build_user_message(items: list[RawItem], match_criteria: str) -> str:
 
 # ── Core Functions ───────────────────────────────────────────────────────────
 
-def _get_client() -> anthropic.AsyncAnthropic:
-    """Get an async Anthropic client. Raises if API key not set."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY environment variable not set. "
-            "Set it before running the watchdog server."
-        )
-    return anthropic.AsyncAnthropic(api_key=api_key)
-
-
-async def evaluate_item(item: RawItem, match_criteria: str) -> MatchResult:
+async def evaluate_item(
+    item: RawItem,
+    match_criteria: str,
+    department: str = "watchdog",
+) -> MatchResult:
     """
     Evaluate a single item against criteria.
     Convenience wrapper around _evaluate_chunk for one-off checks.
     """
-    results = await _evaluate_chunk([item], match_criteria)
+    provider = get_provider(department)
+    results = await _evaluate_chunk([item], match_criteria, provider)
     if not results:
         return MatchResult(matched=False, relevance_score=0.0, reason="Evaluation returned no results", summary="")
     return results[0]
@@ -154,23 +142,27 @@ async def evaluate_batch(
     items: list[RawItem],
     match_criteria: str,
     score_threshold: float = 0.5,
+    department: str = "watchdog",
 ) -> list[tuple[RawItem, MatchResult]]:
     """
     Evaluate a batch of items against criteria.
     Chunks large batches into groups of BATCH_CHUNK_SIZE for focused evaluation.
     Returns only items that meet the score threshold.
+
+    The LLM provider is resolved once via `department` and reused across all
+    chunks — avoids rebuilding the HTTP client per chunk.
     """
     if not items:
         return []
 
-    # Chunk items to keep prompts focused
+    provider = get_provider(department)
     all_results: list[tuple[RawItem, MatchResult]] = []
 
     for chunk_start in range(0, len(items), BATCH_CHUNK_SIZE):
         chunk = items[chunk_start : chunk_start + BATCH_CHUNK_SIZE]
 
         try:
-            match_results = await _evaluate_chunk(chunk, match_criteria)
+            match_results = await _evaluate_chunk(chunk, match_criteria, provider)
         except Exception as e:
             # Log and skip the whole chunk on API failure
             print(f"[matcher] Chunk evaluation failed: {e}")
@@ -183,35 +175,34 @@ async def evaluate_batch(
     return all_results
 
 
-async def _evaluate_chunk(items: list[RawItem], match_criteria: str) -> list[MatchResult]:
+async def _evaluate_chunk(
+    items: list[RawItem],
+    match_criteria: str,
+    provider: LLMProvider,
+) -> list[MatchResult]:
     """
-    Send a chunk of items to Sonnet for evaluation via tool use.
-    Returns one MatchResult per item, in order.
+    Send a chunk of items to the configured provider for evaluation via
+    structured tool use. Returns one MatchResult per item, in order.
     """
-    client = _get_client()
-
-    response = await client.messages.create(
-        model=MODEL,
-        max_tokens=2048,
-        system=SYSTEM_PROMPT,
-        tools=[EVAL_TOOL],
-        tool_choice={"type": "tool", "name": "report_matches"},
-        messages=[
-            {"role": "user", "content": _build_user_message(items, match_criteria)}
-        ],
-    )
-
-    # Extract the tool use block
-    tool_input = None
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "report_matches":
-            tool_input = block.input
-            break
+    try:
+        tool_input = await provider.call_structured(
+            system=SYSTEM_PROMPT,
+            user=_build_user_message(items, match_criteria),
+            tool_schema=EVAL_TOOL["input_schema"],
+            tool_name=EVAL_TOOL["name"],
+            max_tokens=2048,
+        )
+    except Exception as e:
+        print(f"[matcher] Provider call failed: {e}")
+        return [
+            MatchResult(matched=False, relevance_score=0.0, reason=f"Provider error: {e}", summary="")
+            for _ in items
+        ]
 
     if not tool_input or "evaluations" not in tool_input:
-        print(f"[matcher] Unexpected response structure: {response.content}")
+        print(f"[matcher] Unexpected tool output: {tool_input!r}")
         return [
-            MatchResult(matched=False, relevance_score=0.0, reason="Evaluation failed — no tool response", summary="")
+            MatchResult(matched=False, relevance_score=0.0, reason="Evaluation failed — no evaluations in tool output", summary="")
             for _ in items
         ]
 

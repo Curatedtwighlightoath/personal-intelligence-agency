@@ -65,7 +65,35 @@ def init_db(db_path: Path = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_hits_target_id ON hits(target_id);
             CREATE INDEX IF NOT EXISTS idx_hits_surfaced_at ON hits(surfaced_at);
             CREATE INDEX IF NOT EXISTS idx_seen_items_target ON seen_items(target_id);
+
+            -- Per-department LLM configuration. api_key_ref stores the NAME of
+            -- an environment variable (e.g. "ANTHROPIC_API_KEY"), never the
+            -- secret itself. registry.get_provider() resolves it at call time.
+            CREATE TABLE IF NOT EXISTS department_config (
+                department   TEXT PRIMARY KEY,
+                provider     TEXT NOT NULL,
+                model        TEXT NOT NULL,
+                api_key_ref  TEXT,
+                base_url     TEXT,
+                extra        TEXT,
+                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
+
+        # Seed defaults — INSERT OR IGNORE so we never clobber user edits.
+        # Watchdog defaults to Anthropic Sonnet to preserve pre-refactor
+        # behavior. Marketing/rd rows are placeholders until those
+        # departments ship; they're safe to edit now.
+        conn.executemany(
+            """INSERT OR IGNORE INTO department_config
+               (department, provider, model, api_key_ref, base_url, extra)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [
+                ("watchdog",  "anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY", None, "{}"),
+                ("marketing", "anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY", None, "{}"),
+                ("rd",        "anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY", None, "{}"),
+            ],
+        )
         conn.commit()
     finally:
         conn.close()
