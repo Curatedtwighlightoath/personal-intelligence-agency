@@ -12,6 +12,7 @@ import json
 import sys
 import uuid
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -21,10 +22,25 @@ from pydantic import BaseModel
 from db import get_connection, init_db, now_utc
 from models import WatchTarget, Hit, RawItem
 from providers import ALLOWED_PROVIDERS
+from scheduler import start_scheduler, shutdown_scheduler, reload_from_db
 
 # ── Init ────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="PIA Dispatch API", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # APScheduler is started here (not in server.py) because the MCP server
+    # is for stdio tool calls, not long-running background work. Running
+    # both `uvicorn api:app` and the MCP server in separate processes is
+    # the intended deployment — only api.py owns the schedule.
+    init_db()
+    start_scheduler()
+    try:
+        yield
+    finally:
+        shutdown_scheduler()
+
+
+app = FastAPI(title="PIA Dispatch API", version="0.1.0", lifespan=lifespan)
 
 # CORS — allow Vite dev server. In production behind the proxy this is unnecessary.
 app.add_middleware(
@@ -33,9 +49,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-init_db()
-
 
 # ── Pydantic Models (request bodies) ───────────────────────────────────────
 
@@ -117,9 +130,11 @@ def create_target(body: TargetCreate):
         row = conn.execute(
             "SELECT * FROM watch_targets WHERE id = ?", (target.id,)
         ).fetchone()
-        return WatchTarget.from_row(row).to_dict()
+        result = WatchTarget.from_row(row).to_dict()
     finally:
         conn.close()
+    reload_from_db()
+    return result
 
 
 @app.put("/api/targets/{target_id}")
@@ -158,9 +173,11 @@ def update_target(target_id: str, body: TargetUpdate):
         row = conn.execute(
             "SELECT * FROM watch_targets WHERE id = ?", (target_id,)
         ).fetchone()
-        return WatchTarget.from_row(row).to_dict()
+        result = WatchTarget.from_row(row).to_dict()
     finally:
         conn.close()
+    reload_from_db()
+    return result
 
 
 @app.delete("/api/targets/{target_id}")
@@ -179,9 +196,10 @@ def delete_target(target_id: str):
         conn.execute("DELETE FROM seen_items WHERE target_id = ?", (target_id,))
         conn.execute("DELETE FROM watch_targets WHERE id = ?", (target_id,))
         conn.commit()
-        return {"status": "deleted", "target_id": target_id, "name": name}
     finally:
         conn.close()
+    reload_from_db()
+    return {"status": "deleted", "target_id": target_id, "name": name}
 
 
 @app.post("/api/targets/{target_id}/toggle")
@@ -205,9 +223,11 @@ def toggle_target(target_id: str):
         row = conn.execute(
             "SELECT * FROM watch_targets WHERE id = ?", (target_id,)
         ).fetchone()
-        return WatchTarget.from_row(row).to_dict()
+        result = WatchTarget.from_row(row).to_dict()
     finally:
         conn.close()
+    reload_from_db()
+    return result
 
 
 # ── Hits ────────────────────────────────────────────────────────────────────
@@ -420,6 +440,15 @@ def import_seed():
         return {"status": "ok", "added": added, "skipped": skipped}
     finally:
         conn.close()
+
+
+# ── Scheduler ───────────────────────────────────────────────────────────────
+
+@app.post("/api/scheduler/reload")
+def api_scheduler_reload():
+    """Resync scheduler with the DB — call after external edits."""
+    count = reload_from_db()
+    return {"status": "ok", "active_jobs": count}
 
 
 # ── Department Config ───────────────────────────────────────────────────────
