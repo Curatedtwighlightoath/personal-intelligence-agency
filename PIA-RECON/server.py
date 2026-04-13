@@ -428,6 +428,138 @@ def rate_hit(hit_id: str, rating: int) -> dict:
         conn.close()
 
 
+# ── Marketing Tools ──────────────────────────────────────────────────────────
+# Mirror the HTTP API so agentic MCP clients can drive the marketing
+# department directly. All helpers live in marketing/ — this file just
+# wires them into FastMCP tool definitions.
+
+from marketing import db as _mdb
+from marketing.platforms import PLATFORMS as _PLATFORMS
+from marketing.drafter import draft_posts as _draft_posts
+
+
+@mcp.tool()
+def get_product() -> dict:
+    """Return the current product profile (singleton row id='default')."""
+    product = _mdb.get_product()
+    return product or {"error": "No product row found"}
+
+
+@mcp.tool()
+def set_product(
+    name: str,
+    one_liner: str = "",
+    audience: str = "",
+    tone: str = "",
+    key_messages: Optional[list[str]] = None,
+    links: Optional[list[dict]] = None,
+) -> dict:
+    """
+    Upsert the singleton product profile used by the marketing drafter.
+
+    Args:
+        name: Product name (required).
+        one_liner: One-sentence description.
+        audience: Who the product is for.
+        tone: Desired brand voice (e.g. "direct, technical").
+        key_messages: List of short talking points.
+        links: List of {label, url} dicts.
+    """
+    return _mdb.upsert_product(
+        name=name,
+        one_liner=one_liner,
+        audience=audience,
+        tone=tone,
+        key_messages=key_messages or [],
+        links=links or [],
+    )
+
+
+@mcp.tool()
+async def draft_social_posts(
+    platform: str,
+    topic: str,
+    variants: int = 3,
+) -> list[dict]:
+    """
+    Generate and persist N social-post variants for a platform + topic.
+
+    Args:
+        platform: One of 'twitter', 'linkedin', 'instagram', 'tiktok'.
+        topic: The angle or subject the post should cover.
+        variants: Number of variants to generate (1-5).
+
+    Returns:
+        List of saved draft rows.
+    """
+    if platform not in _PLATFORMS:
+        return [{"error": f"Unknown platform '{platform}'. "
+                          f"Supported: {list(_PLATFORMS.keys())}"}]
+    if not (1 <= variants <= 5):
+        return [{"error": "variants must be between 1 and 5"}]
+
+    product = _mdb.get_product() or {
+        "name": "(unset)", "one_liner": "", "audience": "", "tone": "",
+        "key_messages": [], "links": [],
+    }
+    try:
+        drafts = await _draft_posts(
+            platform=platform, topic=topic, product=product, variants=variants,
+        )
+    except Exception as e:
+        return [{"error": f"Draft generation failed: {e}"}]
+
+    return _mdb.save_drafts(platform, topic, drafts)
+
+
+@mcp.tool()
+def list_drafts(
+    platform: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """List persisted draft posts, optionally filtered by platform/status."""
+    try:
+        return _mdb.list_drafts(platform=platform, status=status, limit=limit)
+    except ValueError as e:
+        return [{"error": str(e)}]
+
+
+@mcp.tool()
+def update_draft(
+    draft_id: str,
+    content: Optional[str] = None,
+    status: Optional[str] = None,
+    rating: Optional[int] = None,
+    notes: Optional[str] = None,
+) -> dict:
+    """
+    Update fields on a persisted draft.
+
+    Args:
+        draft_id: UUID of the draft.
+        content: Overwrite the post text.
+        status: One of 'draft', 'approved', 'rejected', 'posted'.
+        rating: 1-5 user rating.
+        notes: Freeform notes.
+    """
+    try:
+        updated = _mdb.update_draft(
+            draft_id, content=content, status=status, rating=rating, notes=notes,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    return updated or {"error": f"Draft not found: {draft_id}"}
+
+
+@mcp.tool()
+def delete_draft(draft_id: str) -> dict:
+    """Delete a draft post by id."""
+    if not _mdb.delete_draft(draft_id):
+        return {"error": f"Draft not found: {draft_id}"}
+    return {"status": "deleted", "draft_id": draft_id}
+
+
 # ── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
