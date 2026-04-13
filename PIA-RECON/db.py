@@ -112,17 +112,18 @@ def init_db(db_path: Path = DB_PATH) -> None:
         """)
 
         # Seed defaults — INSERT OR IGNORE so we never clobber user edits.
-        # Watchdog defaults to Anthropic Sonnet to preserve pre-refactor
-        # behavior. Marketing/rd rows are placeholders until those
-        # departments ship; they're safe to edit now.
+        # Default to Haiku 4.5 across departments: fast, cheap, and during
+        # initial testing Sonnet 4 hit sustained `overloaded_error` while
+        # Haiku responded immediately. Swap per-department via the
+        # Departments UI or the providers CLI.
         conn.executemany(
             """INSERT OR IGNORE INTO department_config
                (department, provider, model, api_key_ref, base_url, extra)
                VALUES (?, ?, ?, ?, ?, ?)""",
             [
-                ("watchdog",  "anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY", None, "{}"),
-                ("marketing", "anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY", None, "{}"),
-                ("rd",        "anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY", None, "{}"),
+                ("watchdog",  "anthropic", "claude-haiku-4-5-20251001", "ANTHROPIC_API_KEY", None, "{}"),
+                ("marketing", "anthropic", "claude-haiku-4-5-20251001", "ANTHROPIC_API_KEY", None, "{}"),
+                ("rd",        "anthropic", "claude-haiku-4-5-20251001", "ANTHROPIC_API_KEY", None, "{}"),
             ],
         )
 

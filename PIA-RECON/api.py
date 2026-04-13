@@ -576,13 +576,20 @@ async def test_department_config(name: str):
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     latency_ms = int((time.monotonic() - start) * 1000)
 
+    # _evaluate_chunk swallows provider exceptions and returns a sentinel
+    # MatchResult with reason prefixed "Provider error: ...". Detect that
+    # so the Test button doesn't falsely report success.
+    reason = results[0].reason or ""
+    if reason.startswith("Provider error:") or reason.startswith("Evaluation failed"):
+        return {"ok": False, "latency_ms": latency_ms, "error": reason}
+
     return {
         "ok": True,
         "latency_ms": latency_ms,
         "sample": {
             "matched": results[0].matched,
             "score": results[0].relevance_score,
-            "reason": results[0].reason,
+            "reason": reason,
         },
     }
 
