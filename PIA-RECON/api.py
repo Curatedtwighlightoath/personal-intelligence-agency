@@ -9,6 +9,7 @@ Usage:
 """
 
 import json
+import os
 import sys
 import uuid
 import asyncio
@@ -24,6 +25,31 @@ from models import WatchTarget, Hit, RawItem
 from providers import ALLOWED_PROVIDERS
 from scheduler import start_scheduler, shutdown_scheduler, reload_from_db
 
+
+def _log_env_presence() -> None:
+    """
+    Log which api_key_ref env vars referenced by department_config are set.
+    Prints only NAME=present|missing — never the value, length, or prefix.
+    A missing value means the provider for that department will fail at
+    first call; fix by exporting the var before launching uvicorn.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT api_key_ref FROM department_config "
+            "WHERE api_key_ref IS NOT NULL AND api_key_ref != ''"
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return
+    parts = [
+        f"{r['api_key_ref']}={'present' if os.environ.get(r['api_key_ref']) else 'missing'}"
+        for r in rows
+    ]
+    print("env check: " + " ".join(parts), flush=True)
+
+
 # ── Init ────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -33,6 +59,7 @@ async def lifespan(_app: FastAPI):
     # both `uvicorn api:app` and the MCP server in separate processes is
     # the intended deployment — only api.py owns the schedule.
     init_db()
+    _log_env_presence()
     start_scheduler()
     try:
         yield

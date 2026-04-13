@@ -161,6 +161,58 @@ personal-intelligence-agency/
 
 Do not force-push to `main` or `test`.
 
+## Security
+
+This repo is public. **Do not commit API keys.** The runtime is built around
+that rule, and there are guardrails to enforce it:
+
+- **Architecture.** `department_config.api_key_ref` stores the *name* of an
+  environment variable (e.g. `ANTHROPIC_API_KEY`). The secret itself lives
+  only in `.env` (gitignored) and your shell. `providers/registry._resolve_key`
+  reads `os.environ[api_key_ref]` at call time and never writes it back to
+  SQLite. See [`PIA-RECON/providers/registry.py`](./PIA-RECON/providers/registry.py).
+
+- **Startup check.** On boot, `api.py` logs one line like
+  `env check: ANTHROPIC_API_KEY=present OPENAI_API_KEY=missing` — names
+  only, never values. If a referenced key is `missing`, that department will
+  fail the first time it tries to call its provider.
+
+- **Pre-commit hook.** A repo-tracked hook at `.githooks/pre-commit` scans
+  staged changes for Anthropic, OpenAI, GitHub, Google, and Slack key
+  patterns and blocks the commit on any match. Enable it once per clone:
+  ```bash
+  git config core.hooksPath .githooks
+  ```
+
+- **Manual scan.** Run `bash scripts/check-no-secrets.sh` at any time to
+  scan the whole working tree. CI (`.github/workflows/secret-scan.yml`)
+  runs the same script on every push and pull request.
+
+- **`.env*` paths are blocked.** The scanner rejects any staged path
+  matching `.env*` except `.env.example`. Put templates in `.env.example`;
+  never commit a real `.env`.
+
+### Rules
+
+1. Never paste a live API key into chat logs, issue/PR descriptions, commit
+   messages, or AI-assistant transcripts. Treat every channel outside your
+   own shell as public.
+2. If a key is exposed — even briefly — rotate it. Revocation is free;
+   waiting is not.
+3. To override the pre-commit hook, use `git commit --no-verify`. This is
+   strongly discouraged and should only be used to unblock a clear false
+   positive.
+
+### Rotation checklist
+
+If you ever paste a key somewhere it shouldn't be:
+
+1. Anthropic → <https://console.anthropic.com/settings/keys> → revoke.
+2. OpenAI → <https://platform.openai.com/api-keys> → revoke.
+3. GitHub → <https://github.com/settings/tokens> → revoke.
+4. Issue a new key, update your local `.env`, restart uvicorn, and confirm
+   the startup `env check:` line shows `present` for the rotated var.
+
 ## Troubleshooting
 
 - **`ModuleNotFoundError: feedparser`** — dependencies aren't installed in
