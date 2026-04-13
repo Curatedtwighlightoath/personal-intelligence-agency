@@ -19,7 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from db import get_connection, init_db, now_utc
-from models import WatchTarget, Hit
+from models import WatchTarget, Hit, RawItem
+from providers import ALLOWED_PROVIDERS
 
 # ── Init ────────────────────────────────────────────────────────────────────
 
@@ -54,6 +55,13 @@ class TargetUpdate(BaseModel):
 
 class RateBody(BaseModel):
     rating: int
+
+class DepartmentConfigUpdate(BaseModel):
+    provider: str
+    model: str
+    api_key_ref: Optional[str] = None
+    base_url: Optional[str] = None
+    extra: Optional[dict] = None
 
 
 # ── Targets ─────────────────────────────────────────────────────────────────
@@ -412,6 +420,142 @@ def import_seed():
         return {"status": "ok", "added": added, "skipped": skipped}
     finally:
         conn.close()
+
+
+# ── Department Config ───────────────────────────────────────────────────────
+# Stores provider/model/api-key-env-var-name per department. Secrets are
+# NEVER stored or returned — only the env var name the backend should read.
+
+def _config_row_to_dict(row) -> dict:
+    return {
+        "department":  row["department"],
+        "provider":    row["provider"],
+        "model":       row["model"],
+        "api_key_ref": row["api_key_ref"],
+        "base_url":    row["base_url"],
+        "extra":       json.loads(row["extra"] or "{}"),
+        "updated_at":  row["updated_at"],
+    }
+
+
+@app.get("/api/departments")
+def list_department_configs():
+    """List all department configs. Does not resolve or return secrets."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM department_config ORDER BY department"
+        ).fetchall()
+        return [_config_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.get("/api/departments/{name}/config")
+def get_department_config(name: str):
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM department_config WHERE department = ?", (name,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"No config for department '{name}'")
+        return _config_row_to_dict(row)
+    finally:
+        conn.close()
+
+
+@app.put("/api/departments/{name}/config")
+def update_department_config(name: str, body: DepartmentConfigUpdate):
+    if body.provider not in ALLOWED_PROVIDERS:
+        raise HTTPException(
+            400,
+            f"provider must be one of {ALLOWED_PROVIDERS}, got '{body.provider}'",
+        )
+
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM department_config WHERE department = ?", (name,)
+        ).fetchone()
+        if not row:
+            # Allow creating new department rows so future departments
+            # (marketing, rd) can be configured before their code ships.
+            conn.execute(
+                """INSERT INTO department_config
+                   (department, provider, model, api_key_ref, base_url, extra)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    name, body.provider, body.model,
+                    body.api_key_ref, body.base_url,
+                    json.dumps(body.extra or {}),
+                ),
+            )
+        else:
+            conn.execute(
+                """UPDATE department_config
+                   SET provider = ?, model = ?, api_key_ref = ?,
+                       base_url = ?, extra = ?, updated_at = ?
+                   WHERE department = ?""",
+                (
+                    body.provider, body.model, body.api_key_ref,
+                    body.base_url, json.dumps(body.extra or {}),
+                    now_utc(), name,
+                ),
+            )
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT * FROM department_config WHERE department = ?", (name,)
+        ).fetchone()
+        return _config_row_to_dict(row)
+    finally:
+        conn.close()
+
+
+@app.post("/api/departments/{name}/test")
+async def test_department_config(name: str):
+    """
+    Round-trip a tiny prompt through the configured provider for this
+    department. Reports latency and any error message. Does not write to
+    hits or watch_targets.
+    """
+    import time
+    from providers import get_provider
+    from providers.base import ProviderError
+
+    dummy_item = RawItem(
+        title="Anthropic releases Claude 4.6",
+        source_url="https://example.com/claude-4-6",
+        content="Anthropic announced Claude 4.6 with improved reasoning.",
+        published_at=None,
+    )
+
+    try:
+        provider = get_provider(name)
+    except ProviderError as e:
+        return {"ok": False, "error": str(e)}
+
+    from matcher import _evaluate_chunk
+
+    start = time.monotonic()
+    try:
+        results = await _evaluate_chunk(
+            [dummy_item], "AI model releases", provider,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    latency_ms = int((time.monotonic() - start) * 1000)
+
+    return {
+        "ok": True,
+        "latency_ms": latency_ms,
+        "sample": {
+            "matched": results[0].matched,
+            "score": results[0].relevance_score,
+            "reason": results[0].reason,
+        },
+    }
 
 
 # ── Health ──────────────────────────────────────────────────────────────────

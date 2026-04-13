@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import DepartmentsPanel from "./DepartmentsPanel";
 
 // ── Design Tokens ──────────────────────────────────────────────────────────
 const T = {
@@ -109,7 +110,7 @@ function Confirm({ msg, onOk, onNo }: { msg: string; onOk: () => void; onNo: () 
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
 function Sidebar({ view, setView, unseenCount }: { view: string; setView: (v: string) => void; unseenCount: number }) {
-  const nav = [{ id: "dashboard", label: "Dashboard", Ic: I.Dashboard }, { id: "watchdog", label: "Watchdog", Ic: I.Shield }, { id: "hits", label: "Intel Feed", Ic: I.Zap, badge: unseenCount }];
+  const nav = [{ id: "dashboard", label: "Dashboard", Ic: I.Dashboard }, { id: "watchdog", label: "Watchdog", Ic: I.Shield }, { id: "hits", label: "Intel Feed", Ic: I.Zap, badge: unseenCount }, { id: "departments", label: "Departments", Ic: I.Gear }];
   const bs = (id: string, a: boolean): React.CSSProperties => ({ display: "flex", alignItems: "center", gap: "1rem", padding: "1rem 1.5rem", border: "none", position: "relative", background: a ? T.sContainer : "transparent", borderLeft: a ? `0.125rem solid ${T.secondary}` : "0.125rem solid transparent", color: a ? T.secondary : T.outline, fontFamily: F.head, fontSize: "0.75rem", fontWeight: 600, letterSpacing: "0.15em", textTransform: "uppercase", cursor: "pointer", transition: "all 0.2s", textAlign: "left", width: "100%" });
   return (
     <aside style={{ position: "fixed", left: 0, top: 0, height: "100vh", width: SIDEBAR_W, zIndex: 40, background: T.sContainerLow, display: "flex", flexDirection: "column", borderRight: `0.0625rem solid ${T.outlineVar}10` }}>
@@ -508,6 +509,7 @@ export default function App() {
           {view === "watchdog" && <WatchdogView targets={targets} refresh={refresh} onRunCheck={handleRunCheck} checking={checking} />}
           {view === "hits" && <HitsView hits={hits} refresh={refresh} />}
           {view === "settings" && <SettingsView targets={targets} hits={hits} refresh={refresh} />}
+          {view === "departments" && <DepartmentsPanel />}
         </div>
       </main>
     </div>);
