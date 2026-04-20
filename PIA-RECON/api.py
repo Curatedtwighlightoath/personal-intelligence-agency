@@ -9,9 +9,11 @@ Usage:
 """
 
 import json
+import os
 import sys
 import uuid
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -19,11 +21,53 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from db import get_connection, init_db, now_utc
-from models import WatchTarget, Hit
+from models import WatchTarget, Hit, RawItem
+from providers import ALLOWED_PROVIDERS
+from scheduler import start_scheduler, shutdown_scheduler, reload_from_db
+
+
+def _log_env_presence() -> None:
+    """
+    Log which api_key_ref env vars referenced by department_config are set.
+    Prints only NAME=present|missing — never the value, length, or prefix.
+    A missing value means the provider for that department will fail at
+    first call; fix by exporting the var before launching uvicorn.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT api_key_ref FROM department_config "
+            "WHERE api_key_ref IS NOT NULL AND api_key_ref != ''"
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return
+    parts = [
+        f"{r['api_key_ref']}={'present' if os.environ.get(r['api_key_ref']) else 'missing'}"
+        for r in rows
+    ]
+    print("env check: " + " ".join(parts), flush=True)
+
 
 # ── Init ────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="PIA Dispatch API", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # APScheduler is started here (not in server.py) because the MCP server
+    # is for stdio tool calls, not long-running background work. Running
+    # both `uvicorn api:app` and the MCP server in separate processes is
+    # the intended deployment — only api.py owns the schedule.
+    init_db()
+    _log_env_presence()
+    start_scheduler()
+    try:
+        yield
+    finally:
+        shutdown_scheduler()
+
+
+app = FastAPI(title="PIA Dispatch API", version="0.1.0", lifespan=lifespan)
 
 # CORS — allow Vite dev server. In production behind the proxy this is unnecessary.
 app.add_middleware(
@@ -32,9 +76,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-init_db()
-
 
 # ── Pydantic Models (request bodies) ───────────────────────────────────────
 
@@ -54,6 +95,13 @@ class TargetUpdate(BaseModel):
 
 class RateBody(BaseModel):
     rating: int
+
+class DepartmentConfigUpdate(BaseModel):
+    provider: str
+    model: str
+    api_key_ref: Optional[str] = None
+    base_url: Optional[str] = None
+    extra: Optional[dict] = None
 
 
 # ── Targets ─────────────────────────────────────────────────────────────────
@@ -109,9 +157,11 @@ def create_target(body: TargetCreate):
         row = conn.execute(
             "SELECT * FROM watch_targets WHERE id = ?", (target.id,)
         ).fetchone()
-        return WatchTarget.from_row(row).to_dict()
+        result = WatchTarget.from_row(row).to_dict()
     finally:
         conn.close()
+    reload_from_db()
+    return result
 
 
 @app.put("/api/targets/{target_id}")
@@ -150,9 +200,11 @@ def update_target(target_id: str, body: TargetUpdate):
         row = conn.execute(
             "SELECT * FROM watch_targets WHERE id = ?", (target_id,)
         ).fetchone()
-        return WatchTarget.from_row(row).to_dict()
+        result = WatchTarget.from_row(row).to_dict()
     finally:
         conn.close()
+    reload_from_db()
+    return result
 
 
 @app.delete("/api/targets/{target_id}")
@@ -171,9 +223,10 @@ def delete_target(target_id: str):
         conn.execute("DELETE FROM seen_items WHERE target_id = ?", (target_id,))
         conn.execute("DELETE FROM watch_targets WHERE id = ?", (target_id,))
         conn.commit()
-        return {"status": "deleted", "target_id": target_id, "name": name}
     finally:
         conn.close()
+    reload_from_db()
+    return {"status": "deleted", "target_id": target_id, "name": name}
 
 
 @app.post("/api/targets/{target_id}/toggle")
@@ -197,9 +250,11 @@ def toggle_target(target_id: str):
         row = conn.execute(
             "SELECT * FROM watch_targets WHERE id = ?", (target_id,)
         ).fetchone()
-        return WatchTarget.from_row(row).to_dict()
+        result = WatchTarget.from_row(row).to_dict()
     finally:
         conn.close()
+    reload_from_db()
+    return result
 
 
 # ── Hits ────────────────────────────────────────────────────────────────────
@@ -412,6 +467,291 @@ def import_seed():
         return {"status": "ok", "added": added, "skipped": skipped}
     finally:
         conn.close()
+
+
+# ── Scheduler ───────────────────────────────────────────────────────────────
+
+@app.post("/api/scheduler/reload")
+def api_scheduler_reload():
+    """Resync scheduler with the DB — call after external edits."""
+    count = reload_from_db()
+    return {"status": "ok", "active_jobs": count}
+
+
+# ── Department Config ───────────────────────────────────────────────────────
+# Stores provider/model/api-key-env-var-name per department. Secrets are
+# NEVER stored or returned — only the env var name the backend should read.
+
+def _config_row_to_dict(row) -> dict:
+    return {
+        "department":  row["department"],
+        "provider":    row["provider"],
+        "model":       row["model"],
+        "api_key_ref": row["api_key_ref"],
+        "base_url":    row["base_url"],
+        "extra":       json.loads(row["extra"] or "{}"),
+        "updated_at":  row["updated_at"],
+    }
+
+
+@app.get("/api/departments")
+def list_department_configs():
+    """List all department configs. Does not resolve or return secrets."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM department_config ORDER BY department"
+        ).fetchall()
+        return [_config_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.get("/api/departments/{name}/config")
+def get_department_config(name: str):
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM department_config WHERE department = ?", (name,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"No config for department '{name}'")
+        return _config_row_to_dict(row)
+    finally:
+        conn.close()
+
+
+@app.put("/api/departments/{name}/config")
+def update_department_config(name: str, body: DepartmentConfigUpdate):
+    if body.provider not in ALLOWED_PROVIDERS:
+        raise HTTPException(
+            400,
+            f"provider must be one of {ALLOWED_PROVIDERS}, got '{body.provider}'",
+        )
+
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM department_config WHERE department = ?", (name,)
+        ).fetchone()
+        if not row:
+            # Allow creating new department rows so future departments
+            # (marketing, rd) can be configured before their code ships.
+            conn.execute(
+                """INSERT INTO department_config
+                   (department, provider, model, api_key_ref, base_url, extra)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    name, body.provider, body.model,
+                    body.api_key_ref, body.base_url,
+                    json.dumps(body.extra or {}),
+                ),
+            )
+        else:
+            conn.execute(
+                """UPDATE department_config
+                   SET provider = ?, model = ?, api_key_ref = ?,
+                       base_url = ?, extra = ?, updated_at = ?
+                   WHERE department = ?""",
+                (
+                    body.provider, body.model, body.api_key_ref,
+                    body.base_url, json.dumps(body.extra or {}),
+                    now_utc(), name,
+                ),
+            )
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT * FROM department_config WHERE department = ?", (name,)
+        ).fetchone()
+        return _config_row_to_dict(row)
+    finally:
+        conn.close()
+
+
+@app.post("/api/departments/{name}/test")
+async def test_department_config(name: str):
+    """
+    Round-trip a tiny prompt through the configured provider for this
+    department. Reports latency and any error message. Does not write to
+    hits or watch_targets.
+    """
+    import time
+    from providers import get_provider
+    from providers.base import ProviderError
+
+    dummy_item = RawItem(
+        title="Anthropic releases Claude 4.6",
+        source_url="https://example.com/claude-4-6",
+        content="Anthropic announced Claude 4.6 with improved reasoning.",
+        published_at=None,
+    )
+
+    try:
+        provider = get_provider(name)
+    except ProviderError as e:
+        return {"ok": False, "error": str(e)}
+
+    from matcher import _evaluate_chunk
+
+    start = time.monotonic()
+    try:
+        results = await _evaluate_chunk(
+            [dummy_item], "AI model releases", provider,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    latency_ms = int((time.monotonic() - start) * 1000)
+
+    # _evaluate_chunk swallows provider exceptions and returns a sentinel
+    # MatchResult with reason prefixed "Provider error: ...". Detect that
+    # so the Test button doesn't falsely report success.
+    reason = results[0].reason or ""
+    if reason.startswith("Provider error:") or reason.startswith("Evaluation failed"):
+        return {"ok": False, "latency_ms": latency_ms, "error": reason}
+
+    return {
+        "ok": True,
+        "latency_ms": latency_ms,
+        "sample": {
+            "matched": results[0].matched,
+            "score": results[0].relevance_score,
+            "reason": reason,
+        },
+    }
+
+
+# ── Marketing ───────────────────────────────────────────────────────────────
+# Product profile (singleton) + ad-hoc social-post drafting. LLM calls route
+# through the `marketing` department's configured provider.
+
+from marketing import db as mdb
+from marketing.platforms import PLATFORMS
+from marketing.drafter import draft_posts as _draft_posts
+
+
+class ProductBody(BaseModel):
+    name: str
+    one_liner: Optional[str] = ""
+    audience: Optional[str] = ""
+    tone: Optional[str] = ""
+    key_messages: Optional[list[str]] = None
+    links: Optional[list[dict]] = None
+
+
+class DraftRequest(BaseModel):
+    platform: str
+    topic: str
+    variants: int = 3
+
+
+class DraftUpdate(BaseModel):
+    content: Optional[str] = None
+    status: Optional[str] = None
+    rating: Optional[int] = None
+    notes: Optional[str] = None
+
+
+@app.get("/api/marketing/platforms")
+def marketing_platforms():
+    """Static platform metadata — used by the UI to label selects and show char limits."""
+    return [
+        {
+            "id": key,
+            "label": spec.label,
+            "char_limit": spec.char_limit,
+            "format_rules": spec.format_rules,
+        }
+        for key, spec in PLATFORMS.items()
+    ]
+
+
+@app.get("/api/marketing/product")
+def marketing_get_product():
+    product = mdb.get_product()
+    if not product:
+        raise HTTPException(404, "No product row found")
+    return product
+
+
+@app.put("/api/marketing/product")
+def marketing_put_product(body: ProductBody):
+    return mdb.upsert_product(
+        name=body.name,
+        one_liner=body.one_liner or "",
+        audience=body.audience or "",
+        tone=body.tone or "",
+        key_messages=body.key_messages or [],
+        links=body.links or [],
+    )
+
+
+@app.post("/api/marketing/draft")
+async def marketing_draft(body: DraftRequest):
+    if body.platform not in PLATFORMS:
+        raise HTTPException(400, f"Unknown platform '{body.platform}'")
+    if not (1 <= body.variants <= 5):
+        raise HTTPException(400, "variants must be between 1 and 5")
+
+    product = mdb.get_product() or {
+        "name": "(unset)", "one_liner": "", "audience": "", "tone": "",
+        "key_messages": [], "links": [],
+    }
+    try:
+        drafts = await _draft_posts(
+            platform=body.platform,
+            topic=body.topic,
+            product=product,
+            variants=body.variants,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Draft generation failed: {e}")
+
+    return mdb.save_drafts(body.platform, body.topic, drafts)
+
+
+@app.get("/api/marketing/drafts")
+def marketing_list_drafts(
+    platform: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+):
+    try:
+        return mdb.list_drafts(platform=platform, status=status, limit=limit)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/marketing/drafts/{draft_id}")
+def marketing_get_draft(draft_id: str):
+    draft = mdb.get_draft(draft_id)
+    if not draft:
+        raise HTTPException(404, f"Draft not found: {draft_id}")
+    return draft
+
+
+@app.put("/api/marketing/drafts/{draft_id}")
+def marketing_update_draft(draft_id: str, body: DraftUpdate):
+    try:
+        updated = mdb.update_draft(
+            draft_id,
+            content=body.content,
+            status=body.status,
+            rating=body.rating,
+            notes=body.notes,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not updated:
+        raise HTTPException(404, f"Draft not found: {draft_id}")
+    return updated
+
+
+@app.delete("/api/marketing/drafts/{draft_id}")
+def marketing_delete_draft(draft_id: str):
+    if not mdb.delete_draft(draft_id):
+        raise HTTPException(404, f"Draft not found: {draft_id}")
+    return {"status": "deleted", "draft_id": draft_id}
 
 
 # ── Health ──────────────────────────────────────────────────────────────────
