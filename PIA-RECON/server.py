@@ -5,14 +5,12 @@ Exposes tools for managing watch targets and retrieving hits.
 Run with: python server.py (stdio transport)
 """
 
-import json
 import sys
-from pathlib import Path
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from db import get_connection, init_db, now_utc, DB_PATH
+from db import get_connection, init_db, now_utc
 from models import WatchTarget, Hit
 from adapters import fetch_source, ADAPTERS
 from matcher import evaluate_batch
@@ -66,10 +64,10 @@ def add_watch_target(
     conn = get_connection()
     try:
         conn.execute(
-            """INSERT INTO watch_targets 
-               (id, name, source_type, source_config, match_criteria, cadence, 
+            """INSERT INTO watch_targets
+               (id, name, source_type, source_config, match_criteria, cadence,
                 enabled, last_checked_at, last_hit_at, consecutive_failures)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             target.to_row(),
         )
         conn.commit()
@@ -123,7 +121,7 @@ def update_watch_target(target_id: str, updates: dict) -> dict:
     conn = get_connection()
     try:
         # Check target exists
-        row = conn.execute("SELECT * FROM watch_targets WHERE id = ?", (target_id,)).fetchone()
+        row = conn.execute("SELECT * FROM watch_targets WHERE id = %s", (target_id,)).fetchone()
         if not row:
             return {"error": f"No target found with id: {target_id}"}
 
@@ -131,22 +129,20 @@ def update_watch_target(target_id: str, updates: dict) -> dict:
         set_clauses = []
         values = []
         for field, value in updates.items():
-            if field == "source_config":
-                value = json.dumps(value)
-            set_clauses.append(f"{field} = ?")
+            set_clauses.append(f"{field} = %s")
             values.append(value)
-        
-        set_clauses.append("updated_at = ?")
+
+        set_clauses.append("updated_at = %s")
         values.append(now_utc())
         values.append(target_id)
 
         conn.execute(
-            f"UPDATE watch_targets SET {', '.join(set_clauses)} WHERE id = ?",
+            f"UPDATE watch_targets SET {', '.join(set_clauses)} WHERE id = %s",
             values,
         )
         conn.commit()
 
-        row = conn.execute("SELECT * FROM watch_targets WHERE id = ?", (target_id,)).fetchone()
+        row = conn.execute("SELECT * FROM watch_targets WHERE id = %s", (target_id,)).fetchone()
         return WatchTarget.from_row(row).to_dict()
     finally:
         conn.close()
@@ -165,12 +161,12 @@ def remove_watch_target(target_id: str) -> dict:
     """
     conn = get_connection()
     try:
-        row = conn.execute("SELECT * FROM watch_targets WHERE id = ?", (target_id,)).fetchone()
+        row = conn.execute("SELECT * FROM watch_targets WHERE id = %s", (target_id,)).fetchone()
         if not row:
             return {"error": f"No target found with id: {target_id}"}
 
         conn.execute(
-            "UPDATE watch_targets SET enabled = FALSE, updated_at = ? WHERE id = ?",
+            "UPDATE watch_targets SET enabled = FALSE, updated_at = %s WHERE id = %s",
             (now_utc(), target_id),
         )
         conn.commit()
@@ -194,7 +190,7 @@ async def run_check(target_id: Optional[str] = None) -> dict:
     try:
         if target_id:
             rows = conn.execute(
-                "SELECT * FROM watch_targets WHERE id = ? AND enabled = TRUE", 
+                "SELECT * FROM watch_targets WHERE id = %s AND enabled = TRUE",
                 (target_id,)
             ).fetchall()
             if not rows:
@@ -237,10 +233,10 @@ async def _check_single_target(target: WatchTarget) -> dict:
         except Exception as e:
             # Increment failure counter
             conn.execute(
-                """UPDATE watch_targets 
+                """UPDATE watch_targets
                    SET consecutive_failures = consecutive_failures + 1,
-                       last_checked_at = ?, updated_at = ?
-                   WHERE id = ?""",
+                       last_checked_at = %s, updated_at = %s
+                   WHERE id = %s""",
                 (now_utc(), now_utc(), target.id),
             )
             conn.commit()
@@ -252,7 +248,7 @@ async def _check_single_target(target: WatchTarget) -> dict:
             if not item.item_hash:
                 continue
             exists = conn.execute(
-                "SELECT 1 FROM seen_items WHERE target_id = ? AND item_hash = ?",
+                "SELECT 1 FROM seen_items WHERE target_id = %s AND item_hash = %s",
                 (target.id, item.item_hash),
             ).fetchone()
             if not exists:
@@ -260,7 +256,7 @@ async def _check_single_target(target: WatchTarget) -> dict:
 
         if not new_items:
             conn.execute(
-                "UPDATE watch_targets SET last_checked_at = ?, consecutive_failures = 0, updated_at = ? WHERE id = ?",
+                "UPDATE watch_targets SET last_checked_at = %s, consecutive_failures = 0, updated_at = %s WHERE id = %s",
                 (now_utc(), now_utc(), target.id),
             )
             conn.commit()
@@ -289,9 +285,9 @@ async def _check_single_target(target: WatchTarget) -> dict:
                 raw_data=item.raw_data,
             )
             conn.execute(
-                """INSERT INTO hits 
+                """INSERT INTO hits
                    (id, target_id, source_url, title, summary, match_reason, relevance_score, raw_data)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                 hit.to_row(),
             )
 
@@ -299,7 +295,8 @@ async def _check_single_target(target: WatchTarget) -> dict:
         for item in new_items:
             if item.item_hash:
                 conn.execute(
-                    "INSERT OR IGNORE INTO seen_items (target_id, item_hash) VALUES (?, ?)",
+                    "INSERT INTO seen_items (target_id, item_hash) VALUES (%s, %s) "
+                    "ON CONFLICT (target_id, item_hash) DO NOTHING",
                     (target.id, item.item_hash),
                 )
 
@@ -313,10 +310,10 @@ async def _check_single_target(target: WatchTarget) -> dict:
             update_fields["last_hit_at"] = now_utc()
 
         conn.execute(
-            """UPDATE watch_targets 
-               SET last_checked_at = ?, consecutive_failures = 0, 
-                   last_hit_at = COALESCE(?, last_hit_at), updated_at = ?
-               WHERE id = ?""",
+            """UPDATE watch_targets
+               SET last_checked_at = %s, consecutive_failures = 0,
+                   last_hit_at = COALESCE(%s, last_hit_at), updated_at = %s
+               WHERE id = %s""",
             (
                 update_fields["last_checked_at"],
                 update_fields.get("last_hit_at"),
@@ -365,10 +362,10 @@ def get_hits(
         params = []
 
         if target_id:
-            conditions.append("h.target_id = ?")
+            conditions.append("h.target_id = %s")
             params.append(target_id)
         if since:
-            conditions.append("h.surfaced_at > ?")
+            conditions.append("h.surfaced_at > %s")
             params.append(since)
         if unseen_only:
             conditions.append("h.seen = FALSE")
@@ -376,12 +373,12 @@ def get_hits(
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
         query = f"""
-            SELECT h.*, wt.name as target_name 
+            SELECT h.*, wt.name as target_name
             FROM hits h
             JOIN watch_targets wt ON h.target_id = wt.id
             {where}
             ORDER BY h.surfaced_at DESC
-            LIMIT ?
+            LIMIT %s
         """
         params.append(limit)
 
@@ -414,12 +411,12 @@ def rate_hit(hit_id: str, rating: int) -> dict:
 
     conn = get_connection()
     try:
-        row = conn.execute("SELECT * FROM hits WHERE id = ?", (hit_id,)).fetchone()
+        row = conn.execute("SELECT * FROM hits WHERE id = %s", (hit_id,)).fetchone()
         if not row:
             return {"error": f"No hit found with id: {hit_id}"}
 
         conn.execute(
-            "UPDATE hits SET rating = ?, seen = TRUE WHERE id = ?",
+            "UPDATE hits SET rating = %s, seen = TRUE WHERE id = %s",
             (rating, hit_id),
         )
         conn.commit()
@@ -564,6 +561,5 @@ def delete_draft(draft_id: str) -> dict:
 
 if __name__ == "__main__":
     print(f"[watchdog] Starting pia-recon-watchdog MCP server", file=sys.stderr)
-    print(f"[watchdog] DB: {DB_PATH}", file=sys.stderr)
     print(f"[watchdog] Registered adapters: {list(ADAPTERS.keys())}", file=sys.stderr)
     mcp.run(transport="stdio")

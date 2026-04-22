@@ -12,7 +12,7 @@ import asyncio
 import sys
 import os
 
-from db import init_db, get_connection, DB_PATH
+from db import init_db, get_connection
 from models import WatchTarget
 from server import _check_single_target
 
@@ -35,7 +35,7 @@ async def main():
 
     if target_filter:
         rows = conn.execute(
-            "SELECT * FROM watch_targets WHERE name = ? AND enabled = TRUE",
+            "SELECT * FROM watch_targets WHERE name = %s AND enabled = TRUE",
             (target_filter,),
         ).fetchall()
         if not rows:
@@ -47,7 +47,6 @@ async def main():
         ).fetchall()
 
     targets = [WatchTarget.from_row(r) for r in rows]
-    print(f"DB: {DB_PATH}")
     print(f"Targets to check: {len(targets)}\n")
 
     total_new_items = 0

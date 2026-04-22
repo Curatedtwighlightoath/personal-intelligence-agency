@@ -36,7 +36,7 @@ async def _run_target(target_id: str) -> None:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM watch_targets WHERE id = ? AND enabled = TRUE",
+            "SELECT * FROM watch_targets WHERE id = %s AND enabled = TRUE",
             (target_id,),
         ).fetchone()
     finally:

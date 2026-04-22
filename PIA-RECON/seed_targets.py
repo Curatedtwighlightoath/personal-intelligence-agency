@@ -363,7 +363,7 @@ def main():
 
     for target in TARGETS:
         existing = conn.execute(
-            "SELECT id FROM watch_targets WHERE name = ?", (target.name,)
+            "SELECT id FROM watch_targets WHERE name = %s", (target.name,)
         ).fetchone()
 
         if existing:
@@ -372,10 +372,10 @@ def main():
             continue
 
         conn.execute(
-            """INSERT INTO watch_targets 
+            """INSERT INTO watch_targets
                (id, name, source_type, source_config, match_criteria, cadence,
                 enabled, last_checked_at, last_hit_at, consecutive_failures)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             target.to_row(),
         )
         print(f"  ADD   {target.name}")

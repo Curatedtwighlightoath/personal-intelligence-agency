@@ -11,13 +11,14 @@ planned:
 3. **R&D** — codes against a target product repository on the user's behalf.
    *Planned.*
 
-Backend: FastAPI + MCP (stdio) + SQLite, under [`PIA-RECON/`](./PIA-RECON/).
-Frontend: React 19 + Vite, under [`PIA-RECON/PIA/`](./PIA-RECON/PIA/).
+Backend: FastAPI + MCP (stdio) + Postgres (with pgvector), under
+[`PIA-RECON/`](./PIA-RECON/). Frontend: React 19 + Vite, under
+[`PIA-RECON/PIA/`](./PIA-RECON/PIA/).
 
 ## Vendor neutrality
 
 Each department stores its own provider, model, and API-key *environment
-variable name* in the `department_config` SQLite table. Swapping between
+variable name* in the `department_config` table. Swapping between
 Anthropic, OpenAI, Ollama, or any OpenAI-compatible endpoint is a config
 change, not a code change. Secrets themselves are never stored in the DB —
 only the name of the env var the backend should read at call time.
@@ -26,14 +27,56 @@ only the name of the env var the backend should read at call time.
 
 - **Python 3.11+** (3.14 is what this was built against)
 - **Node 20+** and **npm** (for the frontend)
-- **SQLite 3** (bundled with Python; no separate install needed)
+- **PostgreSQL 14+** with the **pgvector** extension (see
+  [Database setup](#database-setup) below)
 - At least one LLM provider credential:
   - `ANTHROPIC_API_KEY` for Anthropic, or
   - `OPENAI_API_KEY` for OpenAI, or
   - a local [Ollama](https://ollama.ai/) install (no key needed)
+- An **embedding** provider key — defaults to OpenAI
+  `text-embedding-3-small` (1536-dim). See `.env.example`.
 
 Optional:
 - `GITHUB_TOKEN` — raises the GitHub API rate limit from 60/hr to 5000/hr.
+
+## Database setup
+
+The watchdog and marketing departments (and the planned R&D memory store)
+all share a single Postgres database with the `vector` extension enabled.
+
+### Windows
+
+1. Download the official installer from
+   <https://www.postgresql.org/download/windows/>. Run it and note the
+   `postgres` superuser password you set.
+2. Install **pgvector**. The path of least resistance on Windows is
+   either (a) the prebuilt DLLs from the
+   [pgvector releases page](https://github.com/pgvector/pgvector/releases),
+   dropped into your Postgres `lib` and `share/extension` directories, or
+   (b) building from source per the project's `README` using MSVC.
+   - Fallback if either of the above bites: run Postgres in Docker
+     Desktop instead — the `pgvector/pgvector:pg16` image bundles the
+     extension, and a one-line `docker run` reproduces this same setup.
+3. Create the database and enable the extension:
+   ```powershell
+   createdb -U postgres pia
+   psql -U postgres -d pia -c "CREATE EXTENSION vector;"
+   ```
+4. Set `DATABASE_URL` (and the `EMBEDDING_*` vars) in `.env` — see
+   `PIA-RECON/.env.example` for the format.
+5. Apply the migrations:
+   ```powershell
+   cd PIA-RECON
+   python -m migrations.runner
+   ```
+   `python -m migrations.runner --status` shows what's applied vs pending
+   without touching the DB.
+
+### macOS / Linux
+
+Same flow, with whichever package manager owns Postgres on your box
+(`brew install postgresql pgvector`, `apt install postgresql-16-pgvector`,
+etc.). The `createdb`/`psql`/`migrations.runner` steps are identical.
 
 ## Install
 
@@ -51,14 +94,20 @@ pip install -r requirements.txt
 cp .env.example .env
 $EDITOR .env
 
+# Apply database migrations (assumes Postgres is up and DATABASE_URL is set).
+# See "Database setup" above if you haven't created the DB yet.
+python -m migrations.runner
+
 # ── Frontend ────────────────────────────────────────────────────
 cd PIA
 npm install
 cd ..
 ```
 
-The SQLite database (`PIA-RECON/watchdog.db`) and its tables are created
-automatically on first run — no manual migration step.
+The migration runner is idempotent — re-running it only applies anything
+new. It also runs automatically the first time the API boots, so if
+you've created the DB and set `DATABASE_URL` you can skip the explicit
+step and just start uvicorn.
 
 ## Run
 
@@ -118,7 +167,7 @@ python server.py
 ```
 
 Point your MCP client (Claude Desktop, etc.) at this command. Both
-processes share the same `watchdog.db`.
+processes share the same Postgres database (`DATABASE_URL`).
 
 ## Manual checks without the API
 
@@ -138,7 +187,8 @@ personal-intelligence-agency/
     ├── api.py                   FastAPI app + scheduler lifespan
     ├── server.py                MCP stdio server (same tool surface)
     ├── scheduler.py             APScheduler wiring
-    ├── db.py                    SQLite schema + connection helpers
+    ├── db.py                    psycopg3 connection + jsonb adapters
+    ├── migrations/              Numbered .sql files + Python runner
     ├── matcher.py               LLM match engine (watchdog)
     ├── adapters/                RSS + GitHub source adapters
     ├── providers/               Anthropic / OpenAI / Ollama abstraction
@@ -169,8 +219,9 @@ that rule, and there are guardrails to enforce it:
 - **Architecture.** `department_config.api_key_ref` stores the *name* of an
   environment variable (e.g. `ANTHROPIC_API_KEY`). The secret itself lives
   only in `.env` (gitignored) and your shell. `providers/registry._resolve_key`
-  reads `os.environ[api_key_ref]` at call time and never writes it back to
-  SQLite. See [`PIA-RECON/providers/registry.py`](./PIA-RECON/providers/registry.py).
+  reads `os.environ[api_key_ref]` at call time and never writes it back
+  to the database. See
+  [`PIA-RECON/providers/registry.py`](./PIA-RECON/providers/registry.py).
 
 - **Startup check.** On boot, `api.py` logs one line like
   `env check: ANTHROPIC_API_KEY=present OPENAI_API_KEY=missing` — names

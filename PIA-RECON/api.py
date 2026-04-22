@@ -1,14 +1,13 @@
 """
-PIA Dispatch API — FastAPI bridge to the Watchdog SQLite database.
+PIA Dispatch API — FastAPI bridge to the Watchdog Postgres database.
 
 Sits alongside the existing MCP server and run_checks.py.
-All three share the same watchdog.db via db.py.
+All three share the same Postgres instance via db.py.
 
 Usage:
     uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 """
 
-import json
 import os
 import sys
 import uuid
@@ -124,7 +123,7 @@ def get_target(target_id: str):
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM watch_targets WHERE id = ?", (target_id,)
+            "SELECT * FROM watch_targets WHERE id = %s", (target_id,)
         ).fetchone()
         if not row:
             raise HTTPException(404, f"Target not found: {target_id}")
@@ -149,13 +148,13 @@ def create_target(body: TargetCreate):
             """INSERT INTO watch_targets
                (id, name, source_type, source_config, match_criteria, cadence,
                 enabled, last_checked_at, last_hit_at, consecutive_failures)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             target.to_row(),
         )
         conn.commit()
         # Re-fetch to get created_at/updated_at
         row = conn.execute(
-            "SELECT * FROM watch_targets WHERE id = ?", (target.id,)
+            "SELECT * FROM watch_targets WHERE id = %s", (target.id,)
         ).fetchone()
         result = WatchTarget.from_row(row).to_dict()
     finally:
@@ -170,7 +169,7 @@ def update_target(target_id: str, body: TargetUpdate):
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM watch_targets WHERE id = ?", (target_id,)
+            "SELECT * FROM watch_targets WHERE id = %s", (target_id,)
         ).fetchone()
         if not row:
             raise HTTPException(404, f"Target not found: {target_id}")
@@ -182,23 +181,21 @@ def update_target(target_id: str, body: TargetUpdate):
         set_clauses = []
         values = []
         for field, value in updates.items():
-            if field == "source_config":
-                value = json.dumps(value)
-            set_clauses.append(f"{field} = ?")
+            set_clauses.append(f"{field} = %s")
             values.append(value)
 
-        set_clauses.append("updated_at = ?")
+        set_clauses.append("updated_at = %s")
         values.append(now_utc())
         values.append(target_id)
 
         conn.execute(
-            f"UPDATE watch_targets SET {', '.join(set_clauses)} WHERE id = ?",
+            f"UPDATE watch_targets SET {', '.join(set_clauses)} WHERE id = %s",
             values,
         )
         conn.commit()
 
         row = conn.execute(
-            "SELECT * FROM watch_targets WHERE id = ?", (target_id,)
+            "SELECT * FROM watch_targets WHERE id = %s", (target_id,)
         ).fetchone()
         result = WatchTarget.from_row(row).to_dict()
     finally:
@@ -213,15 +210,15 @@ def delete_target(target_id: str):
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM watch_targets WHERE id = ?", (target_id,)
+            "SELECT * FROM watch_targets WHERE id = %s", (target_id,)
         ).fetchone()
         if not row:
             raise HTTPException(404, f"Target not found: {target_id}")
 
         name = row["name"]
-        conn.execute("DELETE FROM hits WHERE target_id = ?", (target_id,))
-        conn.execute("DELETE FROM seen_items WHERE target_id = ?", (target_id,))
-        conn.execute("DELETE FROM watch_targets WHERE id = ?", (target_id,))
+        conn.execute("DELETE FROM hits WHERE target_id = %s", (target_id,))
+        conn.execute("DELETE FROM seen_items WHERE target_id = %s", (target_id,))
+        conn.execute("DELETE FROM watch_targets WHERE id = %s", (target_id,))
         conn.commit()
     finally:
         conn.close()
@@ -235,20 +232,20 @@ def toggle_target(target_id: str):
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM watch_targets WHERE id = ?", (target_id,)
+            "SELECT * FROM watch_targets WHERE id = %s", (target_id,)
         ).fetchone()
         if not row:
             raise HTTPException(404, f"Target not found: {target_id}")
 
         new_enabled = not bool(row["enabled"])
         conn.execute(
-            "UPDATE watch_targets SET enabled = ?, updated_at = ? WHERE id = ?",
+            "UPDATE watch_targets SET enabled = %s, updated_at = %s WHERE id = %s",
             (new_enabled, now_utc(), target_id),
         )
         conn.commit()
 
         row = conn.execute(
-            "SELECT * FROM watch_targets WHERE id = ?", (target_id,)
+            "SELECT * FROM watch_targets WHERE id = %s", (target_id,)
         ).fetchone()
         result = WatchTarget.from_row(row).to_dict()
     finally:
@@ -272,7 +269,7 @@ def list_hits(
         params = []
 
         if target_id:
-            conditions.append("h.target_id = ?")
+            conditions.append("h.target_id = %s")
             params.append(target_id)
         if unseen_only:
             conditions.append("h.seen = FALSE")
@@ -285,7 +282,7 @@ def list_hits(
             JOIN watch_targets wt ON h.target_id = wt.id
             {where}
             ORDER BY h.surfaced_at DESC
-            LIMIT ?
+            LIMIT %s
         """
         params.append(limit)
 
@@ -309,12 +306,12 @@ def rate_hit(hit_id: str, body: RateBody):
 
     conn = get_connection()
     try:
-        row = conn.execute("SELECT * FROM hits WHERE id = ?", (hit_id,)).fetchone()
+        row = conn.execute("SELECT * FROM hits WHERE id = %s", (hit_id,)).fetchone()
         if not row:
             raise HTTPException(404, f"Hit not found: {hit_id}")
 
         conn.execute(
-            "UPDATE hits SET rating = ?, seen = TRUE WHERE id = ?",
+            "UPDATE hits SET rating = %s, seen = TRUE WHERE id = %s",
             (body.rating, hit_id),
         )
         conn.commit()
@@ -328,11 +325,11 @@ def mark_seen(hit_id: str):
     """Mark a single hit as seen."""
     conn = get_connection()
     try:
-        row = conn.execute("SELECT * FROM hits WHERE id = ?", (hit_id,)).fetchone()
+        row = conn.execute("SELECT * FROM hits WHERE id = %s", (hit_id,)).fetchone()
         if not row:
             raise HTTPException(404, f"Hit not found: {hit_id}")
 
-        conn.execute("UPDATE hits SET seen = TRUE WHERE id = ?", (hit_id,))
+        conn.execute("UPDATE hits SET seen = TRUE WHERE id = %s", (hit_id,))
         conn.commit()
         return {"status": "seen", "hit_id": hit_id}
     finally:
@@ -356,11 +353,11 @@ def delete_hit(hit_id: str):
     """Delete a single hit."""
     conn = get_connection()
     try:
-        row = conn.execute("SELECT * FROM hits WHERE id = ?", (hit_id,)).fetchone()
+        row = conn.execute("SELECT * FROM hits WHERE id = %s", (hit_id,)).fetchone()
         if not row:
             raise HTTPException(404, f"Hit not found: {hit_id}")
 
-        conn.execute("DELETE FROM hits WHERE id = ?", (hit_id,))
+        conn.execute("DELETE FROM hits WHERE id = %s", (hit_id,))
         conn.commit()
         return {"status": "deleted", "hit_id": hit_id}
     finally:
@@ -382,7 +379,7 @@ async def api_run_check(target_id: Optional[str] = None):
     try:
         if target_id:
             rows = conn.execute(
-                "SELECT * FROM watch_targets WHERE id = ? AND enabled = TRUE",
+                "SELECT * FROM watch_targets WHERE id = %s AND enabled = TRUE",
                 (target_id,),
             ).fetchall()
             if not rows:
@@ -448,7 +445,7 @@ def import_seed():
         skipped = 0
         for target in SEED_TARGETS:
             existing = conn.execute(
-                "SELECT id FROM watch_targets WHERE name = ?", (target.name,)
+                "SELECT id FROM watch_targets WHERE name = %s", (target.name,)
             ).fetchone()
             if existing:
                 skipped += 1
@@ -458,7 +455,7 @@ def import_seed():
                 """INSERT INTO watch_targets
                    (id, name, source_type, source_config, match_criteria, cadence,
                     enabled, last_checked_at, last_hit_at, consecutive_failures)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 target.to_row(),
             )
             added += 1
@@ -489,7 +486,7 @@ def _config_row_to_dict(row) -> dict:
         "model":       row["model"],
         "api_key_ref": row["api_key_ref"],
         "base_url":    row["base_url"],
-        "extra":       json.loads(row["extra"] or "{}"),
+        "extra":       row["extra"] or {},
         "updated_at":  row["updated_at"],
     }
 
@@ -512,7 +509,7 @@ def get_department_config(name: str):
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM department_config WHERE department = ?", (name,)
+            "SELECT * FROM department_config WHERE department = %s", (name,)
         ).fetchone()
         if not row:
             raise HTTPException(404, f"No config for department '{name}'")
@@ -532,7 +529,7 @@ def update_department_config(name: str, body: DepartmentConfigUpdate):
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT 1 FROM department_config WHERE department = ?", (name,)
+            "SELECT 1 FROM department_config WHERE department = %s", (name,)
         ).fetchone()
         if not row:
             # Allow creating new department rows so future departments
@@ -540,29 +537,29 @@ def update_department_config(name: str, body: DepartmentConfigUpdate):
             conn.execute(
                 """INSERT INTO department_config
                    (department, provider, model, api_key_ref, base_url, extra)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
                 (
                     name, body.provider, body.model,
                     body.api_key_ref, body.base_url,
-                    json.dumps(body.extra or {}),
+                    body.extra or {},
                 ),
             )
         else:
             conn.execute(
                 """UPDATE department_config
-                   SET provider = ?, model = ?, api_key_ref = ?,
-                       base_url = ?, extra = ?, updated_at = ?
-                   WHERE department = ?""",
+                   SET provider = %s, model = %s, api_key_ref = %s,
+                       base_url = %s, extra = %s, updated_at = %s
+                   WHERE department = %s""",
                 (
                     body.provider, body.model, body.api_key_ref,
-                    body.base_url, json.dumps(body.extra or {}),
+                    body.base_url, body.extra or {},
                     now_utc(), name,
                 ),
             )
         conn.commit()
 
         row = conn.execute(
-            "SELECT * FROM department_config WHERE department = ?", (name,)
+            "SELECT * FROM department_config WHERE department = %s", (name,)
         ).fetchone()
         return _config_row_to_dict(row)
     finally:

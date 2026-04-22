@@ -1,11 +1,10 @@
 """
-Marketing DB helpers — thin SQL wrappers over the shared SQLite connection.
+Marketing DB helpers — thin SQL wrappers over the shared Postgres connection.
 
 Product is a singleton (id='default'). draft_posts rows are keyed by UUIDs
 generated at insert time, consistent with watch_targets/hits.
 """
 
-import json
 import uuid
 from typing import Any, Optional
 
@@ -20,13 +19,7 @@ VALID_STATUSES = ("draft", "approved", "rejected", "posted")
 def _row_to_product(row) -> dict:
     d = dict(row)
     for key in ("key_messages", "links"):
-        val = d.get(key)
-        if isinstance(val, str):
-            try:
-                d[key] = json.loads(val)
-            except json.JSONDecodeError:
-                d[key] = []
-        elif val is None:
+        if d.get(key) is None:
             d[key] = []
     return d
 
@@ -35,7 +28,7 @@ def get_product(product_id: str = "default") -> Optional[dict]:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM product WHERE id = ?", (product_id,)
+            "SELECT * FROM product WHERE id = %s", (product_id,)
         ).fetchone()
         return _row_to_product(row) if row else None
     finally:
@@ -51,15 +44,15 @@ def upsert_product(
     links: Optional[list[dict]] = None,
     product_id: str = "default",
 ) -> dict:
-    km = json.dumps(key_messages or [])
-    ln = json.dumps(links or [])
+    km = key_messages or []
+    ln = links or []
     conn = get_connection()
     try:
         conn.execute(
             """
             INSERT INTO product (id, name, one_liner, audience, tone,
                                  key_messages, links, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 one_liner=excluded.one_liner,
@@ -95,7 +88,7 @@ def save_drafts(platform: str, topic: str, drafts: list[dict]) -> list[dict]:
                 INSERT INTO draft_posts
                     (id, platform, topic, content, rationale,
                      variant_index, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s)
                 """,
                 (
                     draft_id, platform, topic,
@@ -117,7 +110,7 @@ def get_draft(draft_id: str) -> Optional[dict]:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM draft_posts WHERE id = ?", (draft_id,)
+            "SELECT * FROM draft_posts WHERE id = %s", (draft_id,)
         ).fetchone()
         return dict(row) if row else None
     finally:
@@ -140,12 +133,12 @@ def list_drafts(
     clauses: list[str] = []
     args: list[Any] = []
     if platform:
-        clauses.append("platform = ?"); args.append(platform)
+        clauses.append("platform = %s"); args.append(platform)
     if status:
-        clauses.append("status = ?"); args.append(status)
+        clauses.append("status = %s"); args.append(status)
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY created_at DESC LIMIT ?"
+    sql += " ORDER BY created_at DESC LIMIT %s"
     args.append(limit)
 
     conn = get_connection()
@@ -171,24 +164,24 @@ def update_draft(
     fields: list[str] = []
     args: list[Any] = []
     if content is not None:
-        fields.append("content = ?"); args.append(content)
+        fields.append("content = %s"); args.append(content)
     if status is not None:
-        fields.append("status = ?"); args.append(status)
+        fields.append("status = %s"); args.append(status)
     if rating is not None:
-        fields.append("rating = ?"); args.append(rating)
+        fields.append("rating = %s"); args.append(rating)
     if notes is not None:
-        fields.append("notes = ?"); args.append(notes)
+        fields.append("notes = %s"); args.append(notes)
 
     if not fields:
         return get_draft(draft_id)
 
-    fields.append("updated_at = ?"); args.append(now_utc())
+    fields.append("updated_at = %s"); args.append(now_utc())
     args.append(draft_id)
 
     conn = get_connection()
     try:
         cur = conn.execute(
-            f"UPDATE draft_posts SET {', '.join(fields)} WHERE id = ?", args
+            f"UPDATE draft_posts SET {', '.join(fields)} WHERE id = %s", args
         )
         conn.commit()
         if cur.rowcount == 0:
@@ -202,7 +195,7 @@ def update_draft(
 def delete_draft(draft_id: str) -> bool:
     conn = get_connection()
     try:
-        cur = conn.execute("DELETE FROM draft_posts WHERE id = ?", (draft_id,))
+        cur = conn.execute("DELETE FROM draft_posts WHERE id = %s", (draft_id,))
         conn.commit()
         return cur.rowcount > 0
     finally:

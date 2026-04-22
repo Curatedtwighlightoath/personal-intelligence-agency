@@ -6,7 +6,6 @@ department's configured provider via call_structured, return a list of
 {content, rationale} dicts. The caller persists them.
 """
 
-import json
 from typing import Optional
 
 from providers import get_provider
@@ -68,18 +67,7 @@ DRAFT_TOOL = {
 def _product_block(product: dict) -> str:
     """Render the product row into a prompt-friendly block."""
     key_messages = product.get("key_messages") or []
-    if isinstance(key_messages, str):
-        try:
-            key_messages = json.loads(key_messages)
-        except json.JSONDecodeError:
-            key_messages = []
-
     links = product.get("links") or []
-    if isinstance(links, str):
-        try:
-            links = json.loads(links)
-        except json.JSONDecodeError:
-            links = []
 
     lines = [
         f"Name: {product.get('name') or '(unset)'}",

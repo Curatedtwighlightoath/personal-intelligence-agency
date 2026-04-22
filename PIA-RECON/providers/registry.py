@@ -1,12 +1,11 @@
 """
-Provider registry — loads department_config rows from SQLite and
+Provider registry — loads department_config rows from Postgres and
 instantiates the right LLMProvider.
 
 Allow-list of providers is exported so api.py can validate PUT requests
 without reaching into registry internals.
 """
 
-import json
 import os
 
 from db import get_connection
@@ -20,7 +19,7 @@ def _load_row(department: str) -> dict:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM department_config WHERE department = ?", (department,)
+            "SELECT * FROM department_config WHERE department = %s", (department,)
         ).fetchone()
     finally:
         conn.close()
@@ -72,13 +71,3 @@ def get_provider(department: str = "watchdog") -> LLMProvider:
     raise ProviderError(
         f"Unknown provider '{provider}'. Allowed: {ALLOWED_PROVIDERS}"
     )
-
-
-def parse_extra(raw: str | None) -> dict:
-    """department_config.extra is stored as JSON text; decode defensively."""
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {}

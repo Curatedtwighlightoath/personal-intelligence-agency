@@ -1,5 +1,5 @@
 """
-Department config CLI — writes directly to SQLite, no API dependency.
+Department config CLI — writes directly to Postgres, no API dependency.
 
 Usage:
     python -m providers.cli list
@@ -24,14 +24,15 @@ from providers.base import ProviderError
 
 
 def _fmt(row) -> dict:
+    updated_at = row["updated_at"]
     return {
         "department":  row["department"],
         "provider":    row["provider"],
         "model":       row["model"],
         "api_key_ref": row["api_key_ref"],
         "base_url":    row["base_url"],
-        "extra":       json.loads(row["extra"] or "{}"),
-        "updated_at":  row["updated_at"],
+        "extra":       row["extra"] or {},
+        "updated_at":  updated_at.isoformat() if updated_at else None,
     }
 
 
@@ -51,7 +52,7 @@ def cmd_get(args) -> int:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM department_config WHERE department = ?",
+            "SELECT * FROM department_config WHERE department = %s",
             (args.department,),
         ).fetchone()
     finally:
@@ -73,29 +74,29 @@ def cmd_set(args) -> int:
     conn = get_connection()
     try:
         exists = conn.execute(
-            "SELECT 1 FROM department_config WHERE department = ?",
+            "SELECT 1 FROM department_config WHERE department = %s",
             (args.department,),
         ).fetchone()
         if exists:
             conn.execute(
                 """UPDATE department_config
-                   SET provider = ?, model = ?, api_key_ref = ?,
-                       base_url = ?, extra = ?, updated_at = ?
-                   WHERE department = ?""",
+                   SET provider = %s, model = %s, api_key_ref = %s,
+                       base_url = %s, extra = %s, updated_at = %s
+                   WHERE department = %s""",
                 (args.provider, args.model, args.api_key_ref, args.base_url,
-                 json.dumps(extra), now_utc(), args.department),
+                 extra, now_utc(), args.department),
             )
         else:
             conn.execute(
                 """INSERT INTO department_config
                    (department, provider, model, api_key_ref, base_url, extra)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
                 (args.department, args.provider, args.model, args.api_key_ref,
-                 args.base_url, json.dumps(extra)),
+                 args.base_url, extra),
             )
         conn.commit()
         row = conn.execute(
-            "SELECT * FROM department_config WHERE department = ?",
+            "SELECT * FROM department_config WHERE department = %s",
             (args.department,),
         ).fetchone()
     finally:
