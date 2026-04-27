@@ -171,6 +171,28 @@ def supersede(old_id: str, new_id: str) -> bool:
         conn.close()
 
 
+def get_item(item_id: str) -> Optional[dict]:
+    """
+    Fetch a single memory_items row by id. Returns None if not found.
+    Embeddings are stripped — pass the row id back through if you need
+    raw vectors (no current consumer does).
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, department, kind, subject, text, metadata, confidence,
+                   asserted_at, superseded_by, created_at, updated_at
+              FROM memory_items
+             WHERE id = %s
+            """,
+            (item_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
 # ── Ingest pipeline ──────────────────────────────────────────────────────────
 
 async def ingest(text: str, metadata: Optional[dict] = None) -> dict:
