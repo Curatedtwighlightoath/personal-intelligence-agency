@@ -98,8 +98,12 @@ async def main():
             print(f"    • {name}: {err[:60]}")
 
     # DB stats
-    hit_count = conn.execute("SELECT COUNT(*) as c FROM hits").fetchone()["c"]
-    unseen = conn.execute("SELECT COUNT(*) as c FROM hits WHERE seen = FALSE").fetchone()["c"]
+    hit_count = conn.execute(
+        "SELECT COUNT(*) as c FROM chunks WHERE kind = 'hit'"
+    ).fetchone()["c"]
+    unseen = conn.execute(
+        "SELECT COUNT(*) as c FROM chunks WHERE kind = 'hit' AND seen = FALSE"
+    ).fetchone()["c"]
     seen_items = conn.execute("SELECT COUNT(*) as c FROM seen_items").fetchone()["c"]
     print(f"\n  DB totals: {hit_count} hits ({unseen} unseen), {seen_items} seen items")
     print("=" * 60)

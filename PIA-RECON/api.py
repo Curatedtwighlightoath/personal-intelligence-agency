@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from db import get_connection, init_db, now_utc
-from models import WatchTarget, Hit, RawItem
+from models import WatchTarget, RawItem, chunk_row_to_hit_dict
 from providers import ALLOWED_PROVIDERS
 from scheduler import start_scheduler, shutdown_scheduler, reload_from_db
 
@@ -219,7 +219,11 @@ def delete_target(target_id: str):
             raise HTTPException(404, f"Target not found: {target_id}")
 
         name = row["name"]
-        conn.execute("DELETE FROM hits WHERE target_id = ?", (target_id,))
+        conn.execute(
+            "DELETE FROM chunks "
+            "WHERE kind = 'hit' AND json_extract(metadata, '$.target_id') = ?",
+            (target_id,),
+        )
         conn.execute("DELETE FROM seen_items WHERE target_id = ?", (target_id,))
         conn.execute("DELETE FROM watch_targets WHERE id = ?", (target_id,))
         conn.commit()
@@ -268,37 +272,39 @@ def list_hits(
     """Retrieve hits with optional filters. Includes target_name."""
     conn = get_connection()
     try:
-        conditions = []
-        params = []
+        conditions = ["c.department = 'watchdog'", "c.kind = 'hit'"]
+        params: list = []
 
         if target_id:
-            conditions.append("h.target_id = ?")
+            conditions.append("json_extract(c.metadata, '$.target_id') = ?")
             params.append(target_id)
         if unseen_only:
-            conditions.append("h.seen = FALSE")
+            conditions.append("c.seen = FALSE")
 
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-
+        where = "WHERE " + " AND ".join(conditions)
         query = f"""
-            SELECT h.*, wt.name as target_name
-            FROM hits h
-            JOIN watch_targets wt ON h.target_id = wt.id
+            SELECT c.*, wt.name as target_name
+            FROM chunks c
+            LEFT JOIN watch_targets wt
+                ON wt.id = json_extract(c.metadata, '$.target_id')
             {where}
-            ORDER BY h.surfaced_at DESC
+            ORDER BY c.created_at DESC
             LIMIT ?
         """
         params.append(limit)
 
         rows = conn.execute(query, params).fetchall()
-        results = []
-        for row in rows:
-            hit = Hit.from_row(row)
-            d = hit.to_dict()
-            d["target_name"] = row["target_name"]
-            results.append(d)
-        return results
+        return [chunk_row_to_hit_dict(r, target_name=r["target_name"]) for r in rows]
     finally:
         conn.close()
+
+
+def _require_hit(conn, hit_id: str) -> None:
+    row = conn.execute(
+        "SELECT 1 FROM chunks WHERE id = ? AND kind = 'hit'", (hit_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, f"Hit not found: {hit_id}")
 
 
 @app.post("/api/hits/{hit_id}/rate")
@@ -309,13 +315,10 @@ def rate_hit(hit_id: str, body: RateBody):
 
     conn = get_connection()
     try:
-        row = conn.execute("SELECT * FROM hits WHERE id = ?", (hit_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, f"Hit not found: {hit_id}")
-
+        _require_hit(conn, hit_id)
         conn.execute(
-            "UPDATE hits SET rating = ?, seen = TRUE WHERE id = ?",
-            (body.rating, hit_id),
+            "UPDATE chunks SET rating = ?, seen = TRUE, updated_at = ? WHERE id = ?",
+            (body.rating, now_utc(), hit_id),
         )
         conn.commit()
         return {"status": "rated", "hit_id": hit_id, "rating": body.rating}
@@ -328,11 +331,11 @@ def mark_seen(hit_id: str):
     """Mark a single hit as seen."""
     conn = get_connection()
     try:
-        row = conn.execute("SELECT * FROM hits WHERE id = ?", (hit_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, f"Hit not found: {hit_id}")
-
-        conn.execute("UPDATE hits SET seen = TRUE WHERE id = ?", (hit_id,))
+        _require_hit(conn, hit_id)
+        conn.execute(
+            "UPDATE chunks SET seen = TRUE, updated_at = ? WHERE id = ?",
+            (now_utc(), hit_id),
+        )
         conn.commit()
         return {"status": "seen", "hit_id": hit_id}
     finally:
@@ -341,10 +344,14 @@ def mark_seen(hit_id: str):
 
 @app.post("/api/hits/mark-all-seen")
 def mark_all_seen():
-    """Mark all hits as seen."""
+    """Mark all watchdog hits as seen."""
     conn = get_connection()
     try:
-        result = conn.execute("UPDATE hits SET seen = TRUE WHERE seen = FALSE")
+        result = conn.execute(
+            "UPDATE chunks SET seen = TRUE, updated_at = ? "
+            "WHERE kind = 'hit' AND seen = FALSE",
+            (now_utc(),),
+        )
         conn.commit()
         return {"status": "ok", "updated": result.rowcount}
     finally:
@@ -356,11 +363,8 @@ def delete_hit(hit_id: str):
     """Delete a single hit."""
     conn = get_connection()
     try:
-        row = conn.execute("SELECT * FROM hits WHERE id = ?", (hit_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, f"Hit not found: {hit_id}")
-
-        conn.execute("DELETE FROM hits WHERE id = ?", (hit_id,))
+        _require_hit(conn, hit_id)
+        conn.execute("DELETE FROM chunks WHERE id = ?", (hit_id,))
         conn.commit()
         return {"status": "deleted", "hit_id": hit_id}
     finally:
@@ -418,8 +422,12 @@ def get_stats():
     try:
         targets_total = conn.execute("SELECT COUNT(*) as c FROM watch_targets").fetchone()["c"]
         targets_active = conn.execute("SELECT COUNT(*) as c FROM watch_targets WHERE enabled = TRUE").fetchone()["c"]
-        hits_total = conn.execute("SELECT COUNT(*) as c FROM hits").fetchone()["c"]
-        hits_unseen = conn.execute("SELECT COUNT(*) as c FROM hits WHERE seen = FALSE").fetchone()["c"]
+        hits_total = conn.execute(
+            "SELECT COUNT(*) as c FROM chunks WHERE kind = 'hit'"
+        ).fetchone()["c"]
+        hits_unseen = conn.execute(
+            "SELECT COUNT(*) as c FROM chunks WHERE kind = 'hit' AND seen = FALSE"
+        ).fetchone()["c"]
         seen_items = conn.execute("SELECT COUNT(*) as c FROM seen_items").fetchone()["c"]
         total_failures = conn.execute("SELECT COALESCE(SUM(consecutive_failures), 0) as c FROM watch_targets").fetchone()["c"]
 

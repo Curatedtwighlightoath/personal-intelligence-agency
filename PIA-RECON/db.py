@@ -1,6 +1,12 @@
 """
-Watchdog SQLite database layer.
+PIA SQLite database layer.
 Single file, no ORM, no abstractions. Just SQL.
+
+Atomic unit across all departments is `chunks`. Department-specific subtypes
+live in `chunks.kind` ('hit', 'draft_post', 'rd_note', ...) with subtype
+metadata stored as JSON in `chunks.metadata`. Config/state tables
+(watch_targets, seen_items, department_config, product) stay separate
+because they aren't retrievable content.
 """
 
 import sqlite3
@@ -25,6 +31,13 @@ def init_db(db_path: Path = DB_PATH) -> None:
     """Create tables if they don't exist."""
     conn = get_connection(db_path)
     try:
+        # Drop the pre-pivot atomic tables. Their data was test-only and the
+        # rows have been folded into `chunks`. Safe no-op on fresh DBs.
+        conn.executescript("""
+            DROP TABLE IF EXISTS hits;
+            DROP TABLE IF EXISTS draft_posts;
+        """)
+
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS watch_targets (
                 id TEXT PRIMARY KEY,
@@ -41,20 +54,6 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE TABLE IF NOT EXISTS hits (
-                id TEXT PRIMARY KEY,
-                target_id TEXT NOT NULL REFERENCES watch_targets(id),
-                source_url TEXT,
-                title TEXT,
-                summary TEXT,
-                match_reason TEXT,
-                relevance_score REAL,
-                raw_data JSON,
-                surfaced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                seen BOOLEAN DEFAULT FALSE,
-                rating INTEGER
-            );
-
             CREATE TABLE IF NOT EXISTS seen_items (
                 target_id TEXT NOT NULL REFERENCES watch_targets(id),
                 item_hash TEXT NOT NULL,
@@ -62,9 +61,48 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 PRIMARY KEY (target_id, item_hash)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_hits_target_id ON hits(target_id);
-            CREATE INDEX IF NOT EXISTS idx_hits_surfaced_at ON hits(surfaced_at);
             CREATE INDEX IF NOT EXISTS idx_seen_items_target ON seen_items(target_id);
+
+            -- Universal atomic unit. Every retrievable piece of content from
+            -- any department lives here. Subtype-specific fields go in
+            -- `metadata` (JSON). Columns are reserved only for fields the
+            -- query layer filters or sorts on directly.
+            --
+            -- kind values currently in use:
+            --   'hit'        — watchdog match; metadata: {target_id,
+            --                  match_reason, relevance_score, raw_data}
+            --   'draft_post' — marketing post draft; metadata:
+            --                  {platform, variant_index, topic, rationale,
+            --                   notes}
+            --   'rd_note'    — R&D markdown note; the .md file on disk is
+            --                  canonical, this row is the index. content
+            --                  mirrors the file body. source_ref is the
+            --                  repo-relative path; commit_sha is the HEAD
+            --                  the note was written against (staleness).
+            CREATE TABLE IF NOT EXISTS chunks (
+                id           TEXT PRIMARY KEY,
+                department   TEXT NOT NULL,
+                kind         TEXT NOT NULL,
+                title        TEXT,
+                content      TEXT NOT NULL DEFAULT '',
+                source_kind  TEXT,
+                source_ref   TEXT,
+                repo_ref     TEXT,
+                commit_sha   TEXT,
+                metadata     TEXT NOT NULL DEFAULT '{}',
+                parent_id    TEXT REFERENCES chunks(id),
+                embedding    BLOB,
+                rating       INTEGER,
+                status       TEXT NOT NULL DEFAULT 'active',
+                seen         BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunks_dept_kind  ON chunks(department, kind);
+            CREATE INDEX IF NOT EXISTS idx_chunks_created    ON chunks(created_at);
+            CREATE INDEX IF NOT EXISTS idx_chunks_status     ON chunks(status);
+            CREATE INDEX IF NOT EXISTS idx_chunks_repo       ON chunks(repo_ref);
 
             -- Per-department LLM configuration. api_key_ref stores the NAME of
             -- an environment variable (e.g. "ANTHROPIC_API_KEY"), never the
@@ -79,8 +117,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Marketing: singleton product profile. TEXT PK leaves room to
-            -- expand to multiple products later without a migration.
+            -- Marketing: singleton product profile. Edited as a form, not a
+            -- chunk — it's input to the drafter, not retrievable content.
             CREATE TABLE IF NOT EXISTS product (
                 id            TEXT PRIMARY KEY,
                 name          TEXT NOT NULL,
@@ -91,24 +129,6 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 links         TEXT,   -- JSON array of {label,url}
                 updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-
-            -- Marketing: generated social-post drafts.
-            CREATE TABLE IF NOT EXISTS draft_posts (
-                id             TEXT PRIMARY KEY,
-                platform       TEXT NOT NULL,
-                topic          TEXT NOT NULL,
-                content        TEXT NOT NULL,
-                rationale      TEXT,
-                variant_index  INTEGER DEFAULT 0,
-                status         TEXT DEFAULT 'draft',
-                rating         INTEGER,
-                notes          TEXT,
-                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_drafts_platform ON draft_posts(platform);
-            CREATE INDEX IF NOT EXISTS idx_drafts_status   ON draft_posts(status);
-            CREATE INDEX IF NOT EXISTS idx_drafts_created  ON draft_posts(created_at);
         """)
 
         # Seed defaults — INSERT OR IGNORE so we never clobber user edits.

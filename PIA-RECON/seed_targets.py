@@ -352,7 +352,9 @@ def main():
 
     if "--reset" in sys.argv:
         print("Resetting database...")
-        conn.execute("DELETE FROM hits")
+        conn.execute(
+            "DELETE FROM chunks WHERE department = 'watchdog' AND kind = 'hit'"
+        )
         conn.execute("DELETE FROM seen_items")
         conn.execute("DELETE FROM watch_targets")
         conn.commit()

@@ -13,7 +13,8 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from db import get_connection, init_db, now_utc, DB_PATH
-from models import WatchTarget, Hit
+from models import WatchTarget, Chunk, chunk_row_to_hit_dict
+from chunks import insert_chunk
 from adapters import fetch_source, ADAPTERS
 from matcher import evaluate_batch
 
@@ -277,23 +278,23 @@ async def _check_single_target(target: WatchTarget) -> dict:
                 "message": "LLM matcher is stubbed out — implement it to score items.",
             }
 
-        # 4. Store hits and mark items as seen
+        # 4. Store hits as chunks and mark items as seen
         for item, match in matches:
-            hit = Hit(
-                target_id=target.id,
+            chunk = Chunk(
+                department="watchdog",
+                kind="hit",
                 title=item.title,
-                summary=match.summary,
-                match_reason=match.reason,
-                relevance_score=match.relevance_score,
-                source_url=item.source_url,
-                raw_data=item.raw_data,
+                content=match.summary,
+                source_kind="url",
+                source_ref=item.source_url,
+                metadata={
+                    "target_id": target.id,
+                    "match_reason": match.reason,
+                    "relevance_score": match.relevance_score,
+                    "raw_data": item.raw_data,
+                },
             )
-            conn.execute(
-                """INSERT INTO hits 
-                   (id, target_id, source_url, title, summary, match_reason, relevance_score, raw_data)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                hit.to_row(),
-            )
+            insert_chunk(chunk, conn=conn)
 
         # Mark all new items (matched or not) as seen
         for item in new_items:
@@ -361,38 +362,32 @@ def get_hits(
     """
     conn = get_connection()
     try:
-        conditions = []
-        params = []
+        conditions = ["c.department = 'watchdog'", "c.kind = 'hit'"]
+        params: list = []
 
         if target_id:
-            conditions.append("h.target_id = ?")
+            conditions.append("json_extract(c.metadata, '$.target_id') = ?")
             params.append(target_id)
         if since:
-            conditions.append("h.surfaced_at > ?")
+            conditions.append("c.created_at > ?")
             params.append(since)
         if unseen_only:
-            conditions.append("h.seen = FALSE")
+            conditions.append("c.seen = FALSE")
 
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-
+        where = "WHERE " + " AND ".join(conditions)
         query = f"""
-            SELECT h.*, wt.name as target_name 
-            FROM hits h
-            JOIN watch_targets wt ON h.target_id = wt.id
+            SELECT c.*, wt.name as target_name
+            FROM chunks c
+            LEFT JOIN watch_targets wt
+                ON wt.id = json_extract(c.metadata, '$.target_id')
             {where}
-            ORDER BY h.surfaced_at DESC
+            ORDER BY c.created_at DESC
             LIMIT ?
         """
         params.append(limit)
 
         rows = conn.execute(query, params).fetchall()
-        results = []
-        for row in rows:
-            hit = Hit.from_row(row)
-            d = hit.to_dict()
-            d["target_name"] = row["target_name"]
-            results.append(d)
-        return results
+        return [chunk_row_to_hit_dict(r, target_name=r["target_name"]) for r in rows]
     finally:
         conn.close()
 
@@ -414,13 +409,15 @@ def rate_hit(hit_id: str, rating: int) -> dict:
 
     conn = get_connection()
     try:
-        row = conn.execute("SELECT * FROM hits WHERE id = ?", (hit_id,)).fetchone()
+        row = conn.execute(
+            "SELECT 1 FROM chunks WHERE id = ? AND kind = 'hit'", (hit_id,)
+        ).fetchone()
         if not row:
             return {"error": f"No hit found with id: {hit_id}"}
 
         conn.execute(
-            "UPDATE hits SET rating = ?, seen = TRUE WHERE id = ?",
-            (rating, hit_id),
+            "UPDATE chunks SET rating = ?, seen = TRUE, updated_at = ? WHERE id = ?",
+            (rating, now_utc(), hit_id),
         )
         conn.commit()
         return {"status": "rated", "hit_id": hit_id, "rating": rating}

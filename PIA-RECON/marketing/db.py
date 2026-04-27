@@ -1,15 +1,18 @@
 """
 Marketing DB helpers — thin SQL wrappers over the shared SQLite connection.
 
-Product is a singleton (id='default'). draft_posts rows are keyed by UUIDs
-generated at insert time, consistent with watch_targets/hits.
+Product is a singleton (id='default') and stays in its own table because it
+is form-edited config, not retrievable content. Drafts are stored as
+`chunks` rows with kind='draft_post'; subtype fields (platform, topic,
+variant_index, rationale, notes) live in `chunks.metadata`.
 """
 
 import json
-import uuid
 from typing import Any, Optional
 
 from db import get_connection, now_utc
+from models import Chunk, chunk_row_to_draft_dict
+from chunks import insert_chunk, update_chunk as _update_chunk, delete_chunk as _delete_chunk
 from .platforms import PLATFORMS
 
 VALID_STATUSES = ("draft", "approved", "rejected", "posted")
@@ -77,49 +80,55 @@ def upsert_product(
     return get_product(product_id)  # type: ignore[return-value]
 
 
-# ── Drafts ───────────────────────────────────────────────────────────────────
+# ── Drafts (stored as chunks where kind='draft_post') ────────────────────────
 
 def save_drafts(platform: str, topic: str, drafts: list[dict]) -> list[dict]:
     """Persist a batch of freshly generated drafts. Returns the saved rows."""
     if platform not in PLATFORMS:
         raise ValueError(f"Unknown platform {platform!r}")
 
-    saved_ids: list[str] = []
-    ts = now_utc()
+    saved: list[dict] = []
+    for d in drafts:
+        chunk = Chunk(
+            department="marketing",
+            kind="draft_post",
+            title=topic,
+            content=d.get("content", ""),
+            source_kind="manual",
+            metadata={
+                "platform": platform,
+                "topic": topic,
+                "variant_index": int(d.get("variant_index", 0)),
+                "rationale": d.get("rationale", ""),
+                "notes": None,
+            },
+            status="draft",
+        )
+        persisted = insert_chunk(chunk)
+        saved.append(_chunk_to_draft_dict_via_id(persisted.id))
+    return [s for s in saved if s is not None]
+
+
+def _chunk_to_draft_dict_via_id(chunk_id: str) -> Optional[dict]:
+    """Re-read a chunk row from disk and map it to the Draft API shape."""
     conn = get_connection()
     try:
-        for d in drafts:
-            draft_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO draft_posts
-                    (id, platform, topic, content, rationale,
-                     variant_index, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)
-                """,
-                (
-                    draft_id, platform, topic,
-                    d.get("content", ""),
-                    d.get("rationale", ""),
-                    int(d.get("variant_index", 0)),
-                    ts, ts,
-                ),
-            )
-            saved_ids.append(draft_id)
-        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM chunks WHERE id = ?", (chunk_id,)
+        ).fetchone()
+        return chunk_row_to_draft_dict(row) if row else None
     finally:
         conn.close()
-
-    return [get_draft(i) for i in saved_ids if get_draft(i) is not None]  # type: ignore[misc]
 
 
 def get_draft(draft_id: str) -> Optional[dict]:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT * FROM draft_posts WHERE id = ?", (draft_id,)
+            "SELECT * FROM chunks WHERE id = ? AND kind = 'draft_post'",
+            (draft_id,),
         ).fetchone()
-        return dict(row) if row else None
+        return chunk_row_to_draft_dict(row) if row else None
     finally:
         conn.close()
 
@@ -136,22 +145,23 @@ def list_drafts(
     if limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500")
 
-    sql = "SELECT * FROM draft_posts"
-    clauses: list[str] = []
+    sql = "SELECT * FROM chunks WHERE department = 'marketing' AND kind = 'draft_post'"
     args: list[Any] = []
     if platform:
-        clauses.append("platform = ?"); args.append(platform)
+        # Filter on the JSON-encoded metadata column. SQLite ships json_extract
+        # by default, so this works without extensions.
+        sql += " AND json_extract(metadata, '$.platform') = ?"
+        args.append(platform)
     if status:
-        clauses.append("status = ?"); args.append(status)
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
+        sql += " AND status = ?"
+        args.append(status)
     sql += " ORDER BY created_at DESC LIMIT ?"
     args.append(limit)
 
     conn = get_connection()
     try:
         rows = conn.execute(sql, args).fetchall()
-        return [dict(r) for r in rows]
+        return [chunk_row_to_draft_dict(r) for r in rows]
     finally:
         conn.close()
 
@@ -168,42 +178,29 @@ def update_draft(
     if rating is not None and not (1 <= rating <= 5):
         raise ValueError("rating must be 1-5")
 
-    fields: list[str] = []
-    args: list[Any] = []
-    if content is not None:
-        fields.append("content = ?"); args.append(content)
-    if status is not None:
-        fields.append("status = ?"); args.append(status)
-    if rating is not None:
-        fields.append("rating = ?"); args.append(rating)
-    if notes is not None:
-        fields.append("notes = ?"); args.append(notes)
-
-    if not fields:
-        return get_draft(draft_id)
-
-    fields.append("updated_at = ?"); args.append(now_utc())
-    args.append(draft_id)
-
-    conn = get_connection()
-    try:
-        cur = conn.execute(
-            f"UPDATE draft_posts SET {', '.join(fields)} WHERE id = ?", args
-        )
-        conn.commit()
-        if cur.rowcount == 0:
-            return None
-    finally:
-        conn.close()
-
+    metadata_patch = {"notes": notes} if notes is not None else None
+    updated = _update_chunk(
+        draft_id,
+        content=content,
+        status=status,
+        rating=rating,
+        metadata_patch=metadata_patch,
+    )
+    if updated is None or updated.kind != "draft_post":
+        return None
     return get_draft(draft_id)
 
 
 def delete_draft(draft_id: str) -> bool:
+    # Guard against deleting non-draft chunks via the marketing endpoint.
     conn = get_connection()
     try:
-        cur = conn.execute("DELETE FROM draft_posts WHERE id = ?", (draft_id,))
-        conn.commit()
-        return cur.rowcount > 0
+        row = conn.execute(
+            "SELECT 1 FROM chunks WHERE id = ? AND kind = 'draft_post'",
+            (draft_id,),
+        ).fetchone()
+        if not row:
+            return False
     finally:
         conn.close()
+    return _delete_chunk(draft_id)
