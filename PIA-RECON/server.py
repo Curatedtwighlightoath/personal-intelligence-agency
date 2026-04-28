@@ -557,6 +557,149 @@ def delete_draft(draft_id: str) -> dict:
     return {"status": "deleted", "draft_id": draft_id}
 
 
+# ── R&D Tools ────────────────────────────────────────────────────────────────
+# Fact + doc memory over `memory_items`. These are the tools VS Code (and
+# any other MCP client) calls to read/write the user's long-term knowledge
+# base. Implementations live in rd/; this block is the MCP-facing surface.
+
+from rd import db as _rdb
+
+
+@mcp.tool()
+async def ingest_document(text: str, metadata: Optional[dict] = None) -> dict:
+    """
+    Chunk, embed, and store a document in R&D memory. Auto-extracts atomic
+    facts from the text and stores those alongside the chunks. Use when the
+    user wants to teach the assistant something durable — paper notes, ADRs,
+    meeting summaries, code-design rationale.
+
+    Args:
+        text: The document text. Plain text or markdown; structure-aware
+            chunking respects blank-line paragraph breaks.
+        metadata: Optional free-form dict carried on every chunk and fact
+            row (e.g. {"title": "...", "url": "...", "tags": [...]}).
+
+    Returns:
+        {source_id, chunks, facts, chunk_ids, fact_ids} — source_id ties
+        all chunks and extracted facts from this call together.
+    """
+    if not text or not text.strip():
+        return {"error": "text must be non-empty"}
+    try:
+        return await _rdb.ingest(text, metadata=metadata)
+    except (ValueError, RuntimeError) as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def search_memory(
+    query: str,
+    kind: Optional[str] = None,
+    k: int = 10,
+    include_superseded: bool = False,
+) -> list[dict]:
+    """
+    Cosine-similarity search over R&D memory. Use this BEFORE answering
+    questions about the user's prior work or stated preferences — it's
+    cheaper and more accurate than asking them to repeat themselves.
+
+    Args:
+        query: Natural-language search string. Will be embedded and
+            compared against stored chunks/facts.
+        kind: Filter to 'doc' (raw text chunks) or 'fact' (extracted
+            atomic claims). None searches both.
+        k: Number of results to return, 1-200. Default 10.
+        include_superseded: If True, include facts that have been
+            replaced by newer assertions. Default False.
+
+    Returns:
+        Ranked list of rows; each row carries a `distance` field
+        (lower = more similar; cosine distance is in [0, 2]).
+    """
+    try:
+        return await _rdb.search(
+            query, kind=kind, k=k, include_superseded=include_superseded,
+        )
+    except (ValueError, RuntimeError) as e:
+        return [{"error": str(e)}]
+
+
+@mcp.tool()
+async def add_fact(
+    subject: str,
+    statement: str,
+    confidence: float = 1.0,
+    metadata: Optional[dict] = None,
+) -> dict:
+    """
+    Record a single atomic fact in R&D memory. Use when the user asserts
+    something durable that wasn't in an ingested document — preferences,
+    decisions, project conventions.
+
+    Args:
+        subject: Short noun phrase identifying what the fact is about.
+        statement: Complete standalone sentence asserting the fact.
+        confidence: 0.0-1.0; how strongly the user/source asserts it.
+            Default 1.0 (definitive). Clamped to [0, 1] at write time.
+        metadata: Optional free-form dict (source URL, tags, etc).
+
+    Returns:
+        {id} on success, {error} on validation failure.
+    """
+    try:
+        fact_id = await _rdb.add_fact(
+            subject=subject,
+            statement=statement,
+            confidence=confidence,
+            metadata=metadata,
+        )
+    except (ValueError, RuntimeError) as e:
+        return {"error": str(e)}
+    return {"id": fact_id}
+
+
+@mcp.tool()
+def supersede_fact(old_id: str, new_id: str) -> dict:
+    """
+    Mark an old fact as replaced by a newer one. Both rows continue to
+    exist; superseded rows are hidden from search by default. Use when
+    the user corrects or updates a previously-recorded fact.
+
+    Args:
+        old_id: The id of the row being replaced.
+        new_id: The id of the replacement row.
+
+    Returns:
+        {status: "superseded"} on success, {error} otherwise.
+    """
+    try:
+        ok = _rdb.supersede(old_id, new_id)
+    except ValueError as e:
+        return {"error": str(e)}
+    if not ok:
+        return {"error": f"No row found with id {old_id}"}
+    return {"status": "superseded", "old_id": old_id, "new_id": new_id}
+
+
+@mcp.tool()
+def get_memory_item(item_id: str) -> dict:
+    """
+    Fetch a single memory_items row by id. Useful after `search_memory`
+    returns a hit you want full detail on (the search response strips
+    embeddings to keep payloads small).
+
+    Args:
+        item_id: UUID of the row.
+
+    Returns:
+        The row as a dict, or {error} if not found.
+    """
+    item = _rdb.get_item(item_id)
+    if not item:
+        return {"error": f"Item not found: {item_id}"}
+    return item
+
+
 # ── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

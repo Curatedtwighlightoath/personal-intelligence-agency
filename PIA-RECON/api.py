@@ -751,6 +751,78 @@ def marketing_delete_draft(draft_id: str):
     return {"status": "deleted", "draft_id": draft_id}
 
 
+# ── R&D ─────────────────────────────────────────────────────────────────────
+# Fact + doc memory backed by `memory_items` (pgvector). Ingest chunks text,
+# embeds each chunk, stores `kind='doc'` rows, then runs the rd-department
+# LLM to extract atomic facts and stores those as `kind='fact'` rows. Search
+# is pure cosine over the HNSW index.
+
+from rd import db as rdb
+
+
+class RDIngestBody(BaseModel):
+    text: str
+    metadata: Optional[dict] = None
+
+
+class RDSearchBody(BaseModel):
+    query: str
+    kind: Optional[str] = None  # 'doc', 'fact', or None for both
+    k: int = 10
+    include_superseded: bool = False
+
+
+class RDFactBody(BaseModel):
+    subject: str
+    statement: str
+    confidence: float = 1.0
+    metadata: Optional[dict] = None
+
+
+@app.post("/api/rd/ingest")
+async def rd_ingest(body: RDIngestBody):
+    if not body.text or not body.text.strip():
+        raise HTTPException(400, "text must be non-empty")
+    try:
+        return await rdb.ingest(body.text, metadata=body.metadata)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        # Missing OPENAI_API_KEY / dimension mismatch / unsupported provider.
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/rd/search")
+async def rd_search(body: RDSearchBody):
+    try:
+        return await rdb.search(
+            body.query,
+            kind=body.kind,
+            k=body.k,
+            include_superseded=body.include_superseded,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/rd/facts")
+async def rd_add_fact(body: RDFactBody):
+    try:
+        fact_id = await rdb.add_fact(
+            subject=body.subject,
+            statement=body.statement,
+            confidence=body.confidence,
+            metadata=body.metadata,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return {"id": fact_id}
+
+
 # ── Health ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")

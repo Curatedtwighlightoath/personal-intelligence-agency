@@ -1,0 +1,34 @@
+# Keep secrets, caches, and the React frontend out of the image.
+.env
+.env.*
+!.env.example
+
+# React app — built/served separately
+PIA/
+**/node_modules/
+
+# Python caches and tooling
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Docker artifacts and editor noise
+.git/
+.gitignore
+.githooks/
+.github/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Docs and runbooks don't need to ship in the image
+DEPLOY.md
+MIGRATION_HANDOFF.md
+README.md
